@@ -1,0 +1,122 @@
+version: '3.8'
+services:
+  mqueue-postgres1:
+    image: postgres:15
+    environment:
+      - POSTGRES_DB=mqueue
+      - POSTGRES_USER=morah_paul
+      - POSTGRES_PASSWORD=morah_paul
+    ports:
+      - "5434:5432"
+    volumes:
+      - ./create_table.sql:/docker-entrypoint-initdb.d/create_table.sql
+      - pg1_data:/var/lib/postgresql/data
+    networks:
+      - mqueue-network
+
+  mqueue-postgres2:
+    image: postgres:15
+    environment:
+      - POSTGRES_DB=mqueue
+      - POSTGRES_USER=morah_paul
+      - POSTGRES_PASSWORD=morah_paul
+    ports:
+      - "5433:5432"
+    volumes:
+      - ./create_table.sql:/docker-entrypoint-initdb.d/create_table.sql
+      - pg2_data:/var/lib/postgresql/data
+    networks:
+      - mqueue-network
+
+  mqueue-redis1:
+    image: redis:7
+    ports:
+      - "6379:6379"
+    command: redis-server --requirepass securepassword
+    networks:
+      - mqueue-network
+
+  mqueue-redis1-replica:
+    image: redis:7
+    ports:
+      - "6381:6379"
+    command: redis-server --replicaof mqueue-redis1 6379 --masterauth securepassword
+    depends_on:
+      - mqueue-redis1
+    networks:
+      - mqueue-network
+
+  mqueue-redis2:
+    image: redis:7
+    ports:
+      - "6380:6379"
+    command: redis-server --requirepass securepassword
+    networks:
+      - mqueue-network
+
+  mqueue-redis2-replica:
+    image: redis:7
+    ports:
+      - "6382:6379"
+    command: redis-server --replicaof mqueue-redis2 6379 --masterauth securepassword
+    depends_on:
+      - mqueue-redis2
+    networks:
+      - mqueue-network
+
+  mqueue-sentinel1:
+    image: redis:7
+    ports:
+      - "26379:26379"
+    volumes:
+      - ./sentinel.conf:/etc/redis/sentinel.conf
+    command: redis-sentinel /etc/redis/sentinel.conf
+    depends_on:
+      - mqueue-redis1
+      - mqueue-redis1-replica
+      - mqueue-redis2
+      - mqueue-redis2-replica
+    networks:
+      - mqueue-network
+
+  mqueue-sentinel2:
+    image: redis:7
+    ports:
+      - "26380:26379"
+    volumes:
+      - ./sentinel.conf:/etc/redis/sentinel.conf
+    command: redis-sentinel /etc/redis/sentinel.conf
+    depends_on:
+      - mqueue-redis1
+      - mqueue-redis1-replica
+      - mqueue-redis2
+      - mqueue-redis2-replica
+    networks:
+      - mqueue-network
+
+  mqueue-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+      - "2112:2112"
+    depends_on:
+      - mqueue-postgres1
+      - mqueue-postgres2
+      - mqueue-redis1
+      - mqueue-redis2
+      - mqueue-sentinel1
+      - mqueue-sentinel2
+    volumes:
+      - ./wal:/app/wal
+    networks:
+      - mqueue-network
+
+volumes:
+  pg1_data:
+  pg2_data:
+
+networks:
+  mqueue-network:
+    driver: bridge

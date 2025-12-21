@@ -1,0 +1,19 @@
+groups:
+- name: mqueue_alerts
+  rules:
+  - alert: HighQueueDepth
+    expr: mqueue_queue_depth > 1000
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "High queue depth detected"
+      description: "Queue depth for namespace {{ $labels.namespace }} and topic {{ $labels.topic }} is {{ $value }}, exceeding 1000 for 5 minutes."
+  - alert: ShardUnhealthy
+    expr: mqueue_shard_health == 0
+    for: 1m
+    labels:
+      severity: critical
+    annotations:
+      summary: "Shard unhealthy"
+      description: "Shard {{ $labels.shard }} of type {{ $labels.type }} is unhealthy for 1 minute."

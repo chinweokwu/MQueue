@@ -1,0 +1,5 @@
+# mqueue/internal/prefetch
+internal/prefetch/redis_prefetch.go:37:30: store.Item is not a type
+# mqueue/internal/server
+internal/server/router.go:81:25: store.Item is not a type
+internal/server/router.go:84:21: store.Item is not a type
