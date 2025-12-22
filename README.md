@@ -1,4 +1,4 @@
-# mqueue — Distributed, Sharded, Priority Message Queue
+# MQueue (Distributed, Sharded, Priority Message Queue)
 
 mqueue is a high-performance, distributed, sharded priority message queue written in **Go**, designed for **at-least-once delivery**, **low-latency dequeue**, **durability**, and **multi-tenancy**.
 
@@ -280,6 +280,7 @@ make integration-test   # Integration tests (requires Docker)
 ````
 ## License
 MIT License
+
 
 
 
