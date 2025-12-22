@@ -140,12 +140,6 @@ mqueue blends durability, speed, and recoverability by combining PostgreSQL, Red
 - Go 1.24 (optional for local development)
 ---
 
-## Installation & Quick Start (Docker Compose)
-
-### Prerequisites
-- Docker & Docker Compose
-- Go 1.24+ (optional, for development)
-
 ### 1. Clone the Repository
 
 ```bash
@@ -286,5 +280,6 @@ make integration-test   # Integration tests (requires Docker)
 ````
 ## License
 MIT License
+
 
 
