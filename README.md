@@ -243,7 +243,7 @@ curl -k -X POST https://localhost:8080/nack \
     "topic": "leads",
     "error": "Processing failed"
   }'
-After MaxRetries (default 3), the message moves to DLQ.
+# After MaxRetries (default 3), the message moves to DLQ.
 `````
 ### View Dead Letter Queue
 ```Bash
@@ -280,6 +280,7 @@ make integration-test   # Integration tests (requires Docker)
 ````
 ## License
 MIT License
+
 
 
 
