@@ -183,12 +183,16 @@ Wait ~60 seconds for services to initialise.
 curl -k https://localhost:8080/health
 # → OK
 `````
-# Metrics
+### Metrics
+```Bash
 curl -k https://localhost:2112/metrics | grep mqueue_shard_health
-# → should show 1 for all shards
-Authentication
+# should show 1 for all shards
+````
+
+#### Authentication
 All endpoints except /health require a valid JWT token in the header:
-textAuthorization: Bearer <token>
+````text
+Authorisation: Bearer <token>
 Generate a JWT Token
 Use https://jwt.io
 
@@ -204,7 +208,8 @@ Copy the generated token.
 API Examples
 Replace YOUR_JWT with your generated token.
 1. Enqueue Messages
-Bashcurl -k -X POST https://localhost:8080/enqueue \
+`````Bash
+curl -k -X POST https://localhost:8080/enqueue \
   -H "Authorisation: Bearer YOUR_JWT" \
   -H "Content-Type: application/json" \
   -d '[{
@@ -214,13 +219,17 @@ Bashcurl -k -X POST https://localhost:8080/enqueue \
     "payload": "eyJuYW1lIjoiSm9obiBEb2UifQ==",  // base64: {"name":"John Doe"}
     "deliver_after": "2025-12-25T10:00:00Z"
   }]'
-Returns an array of assigned message IDs.
-2. Dequeue Messages
-Bashcurl -k "https://localhost:8080/dequeue?namespace=default&topic=leads&limit=10" \
+# Returns an array of assigned message IDs.
+````
+### 3. Dequeue Messages
+````Bash
+curl -k "https://localhost:8080/dequeue?namespace=default&topic=leads&limit=10" \
   -H "Authorisation: Bearer YOUR_JWT"
-Returns up to limit messages.
-3. Ack (Successful Processing)
-Bashcurl -k -X POST https://localhost:8080/ack \
+# Returns up to limit messages.
+`````
+4. Ack (Successful Processing)
+`````Bash
+curl -k -X POST https://localhost:8080/ack \
   -H "Authorisation: Bearer YOUR_JWT" \
   -H "Content-Type: application/json" \
   -d '{
@@ -228,7 +237,8 @@ Bashcurl -k -X POST https://localhost:8080/ack \
     "namespace": "default",
     "topic": "leads"
   }'
-4. Nack (Failure → Retry)
+```````
+6. Nack (Failure → Retry)
 Bashcurl -k -X POST https://localhost:8080/nack \
   -H "Authorisation: Bearer YOUR_JWT" \
   -H "Content-Type: application/json" \
@@ -239,10 +249,10 @@ Bashcurl -k -X POST https://localhost:8080/nack \
     "error": "Processing failed"
   }'
 After MaxRetries (default 3), the message moves to DLQ.
-5. View Dead Letter Queue
+7. View Dead Letter Queue
 Bashcurl -k "https://localhost:8080/dlq?namespace=default&topic=leads&limit=10" \
   -H "Authorisation: Bearer YOUR_JWT"
-6. Delete from DLQ
+8. Delete from DLQ
 Bashcurl -k -X POST https://localhost:8080/dlq/delete \
   -H "Authorisation: Bearer YOUR_JWT" \
   -H "Content-Type: application/json" \
@@ -268,3 +278,4 @@ make test               # Unit tests
 make integration-test   # Integration tests (requires Docker)
 License
 MIT License
+
