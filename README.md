@@ -126,19 +126,18 @@ Avoid **mqueue** if your problem looks like any of the following:
 
 mqueue blends durability, speed, and recoverability by combining PostgreSQL, Redis, and WAL-based recovery.
 
-![Architecture Diagram](https://github.com/user-attachments/assets/dcd406b4-0726-4bf1-becb-bb2e9b3cb6ad)
+(<img width="1414" height="919" alt="image" src="https://github.com/user-attachments/assets/beb639a6-04b4-4221-8c02-81740a1be6d3" />)
 
-### Background Daemons
+**Background Daemons**:
+- **Flusher** → Drains Redis buffer → PostgreSQL (with circuit breaker)
+- **Prefetcher** → Leases items → Priority heap merge → Redis Ready Queue
+- **Lease Daemon** → Renews active leases in Redis + PostgreSQL
 
-- **Flusher**  
-  Drains Redis buffer → PostgreSQL (with circuit breaker protection)
+## Installation & Quick Start (Docker Compose)
 
-- **Prefetcher**  
-  Leases messages → merges by priority → fills Redis ready queue
-
-- **Lease Daemon**  
-  Renews active leases in Redis and PostgreSQL
-
+### Prerequisites
+- Docker & Docker Compose
+- Go 1.24 (optional for local development)
 ---
 
 ## Installation & Quick Start (Docker Compose)
@@ -204,11 +203,12 @@ JSON{
   "sub": "test-user",
   "exp": 1930000000
 }
+`````
 Copy the generated token.
 API Examples
 Replace YOUR_JWT with your generated token.
-1. Enqueue Messages
-`````Bash
+### Enqueue Messages
+````Bash
 curl -k -X POST https://localhost:8080/enqueue \
   -H "Authorisation: Bearer YOUR_JWT" \
   -H "Content-Type: application/json" \
@@ -219,15 +219,15 @@ curl -k -X POST https://localhost:8080/enqueue \
     "payload": "eyJuYW1lIjoiSm9obiBEb2UifQ==",  // base64: {"name":"John Doe"}
     "deliver_after": "2025-12-25T10:00:00Z"
   }]'
-# Returns an array of assigned message IDs.
+ # Returns an array of assigned message IDs.
 ````
-### 3. Dequeue Messages
+### Dequeue Messages
 ````Bash
 curl -k "https://localhost:8080/dequeue?namespace=default&topic=leads&limit=10" \
   -H "Authorisation: Bearer YOUR_JWT"
 # Returns up to limit messages.
 `````
-4. Ack (Successful Processing)
+### Ack (Successful Processing)
 `````Bash
 curl -k -X POST https://localhost:8080/ack \
   -H "Authorisation: Bearer YOUR_JWT" \
@@ -238,8 +238,9 @@ curl -k -X POST https://localhost:8080/ack \
     "topic": "leads"
   }'
 ```````
-6. Nack (Failure → Retry)
-Bashcurl -k -X POST https://localhost:8080/nack \
+### Nack (Failure → Retry)
+````Bash
+curl -k -X POST https://localhost:8080/nack \
   -H "Authorisation: Bearer YOUR_JWT" \
   -H "Content-Type: application/json" \
   -d '{
@@ -249,11 +250,15 @@ Bashcurl -k -X POST https://localhost:8080/nack \
     "error": "Processing failed"
   }'
 After MaxRetries (default 3), the message moves to DLQ.
-7. View Dead Letter Queue
-Bashcurl -k "https://localhost:8080/dlq?namespace=default&topic=leads&limit=10" \
+`````
+### View Dead Letter Queue
+```Bash
+curl -k "https://localhost:8080/dlq?namespace=default&topic=leads&limit=10" \
   -H "Authorisation: Bearer YOUR_JWT"
-8. Delete from DLQ
-Bashcurl -k -X POST https://localhost:8080/dlq/delete \
+````
+### Delete from DLQ
+```Bash
+curl -k -X POST https://localhost:8080/dlq/delete \
   -H "Authorisation: Bearer YOUR_JWT" \
   -H "Content-Type: application/json" \
   -d '{
@@ -261,21 +266,25 @@ Bashcurl -k -X POST https://localhost:8080/dlq/delete \
     "namespace": "default",
     "topic": "leads"
   }'
-Monitoring
-
-Metrics Endpoint: https://localhost:2112/metrics (TLS)
+````
+### Monitoring
+```bash
+Metrics End
+point: https://localhost:2112/metrics (TLS)
 Key metrics:
 mqueue_buffer_queue_depth — items waiting to be flushed
 mqueue_ready_queue_depth — items in fast path
 mqueue_enqueue_total, mqueue_dequeue_total
 mqueue_shard_health — 1 = healthy
-
-
-Development
-Bashmake build              # Build binary
+```
+### Development
+```Bash
+make build              # Build binary
 make run                # Run locally
 make test               # Unit tests
 make integration-test   # Integration tests (requires Docker)
-License
+````
+## License
 MIT License
+
 
