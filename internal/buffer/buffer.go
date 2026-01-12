@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"mqueue/internal/config"
+	"mqueue/internal/id"
 	"mqueue/internal/log"
 	"mqueue/internal/store"
 	"mqueue/internal/wal"
@@ -19,14 +20,20 @@ type RedisBuffer struct {
 	cfg     *config.Config
 	store   *store.PGStore
 	logger  *log.Logger
+	node    *id.Node
 }
 
 func NewRedisBuffer(clients []*redis.Client, cfg *config.Config, store *store.PGStore, logger *log.Logger) *RedisBuffer {
+	node, err := id.NewNode(cfg.NodeID)
+	if err != nil {
+		logger.Fatal("Failed to initialize ID generator", zap.Error(err))
+	}
 	return &RedisBuffer{
 		clients: clients,
 		cfg:     cfg,
 		store:   store,
 		logger:  logger,
+		node:    node,
 	}
 }
 
@@ -56,8 +63,17 @@ func (b *RedisBuffer) Enqueue(ctx context.Context, items []store.Item, wals *wal
 		// In-memory deduplication for items in the same request batch
 		seenInBatch := make(map[string]bool)
 
-		for _, item := range shardItems {
-			// Non-idempotent items: always enqueue
+		var ids []int64
+
+		for i := range shardItems {
+			// Pointer to item allows modification
+			item := &shardItems[i]
+
+			// Generate ID immediately (Async Enqueue Magic)
+			item.ID = b.node.Generate()
+			ids = append(ids, item.ID)
+
+			// Non-idempotent items: enqueue
 			if item.IdempotencyKey == nil {
 				data, err := json.Marshal(item)
 				if err != nil {
@@ -118,40 +134,8 @@ func (b *RedisBuffer) Enqueue(ctx context.Context, items []store.Item, wals *wal
 			return nil, fmt.Errorf("write to WAL: %w", err)
 		}
 
-		// Upsert to Postgres — final source of truth + gets real IDs
-		ids, err := b.store.UpsertItems(ctx, shardItems)
-		if err != nil {
-			b.logger.Error("Failed to upsert items to Postgres", zap.Error(err))
-			return nil, fmt.Errorf("upsert items: %w", err)
-		}
-
-		// Rewrite buffer with real IDs + extend dedup TTLs
-		pipe = client.Pipeline()
-		pipe.Del(ctx, listKey) // Clear old version
-
-		for i, item := range shardItems {
-			item.ID = ids[i]
-			data, err := json.Marshal(item)
-			if err != nil {
-				return nil, fmt.Errorf("marshal item with ID: %w", err)
-			}
-			pipe.LPush(ctx, listKey, data)
-
-			// Extend dedup key TTL if present
-			if item.IdempotencyKey != nil {
-				dedupKey := fmt.Sprintf("mqueue:dedup:%s:%s:%s", key.namespace, key.topic, *item.IdempotencyKey)
-				pipe.Expire(ctx, dedupKey, b.cfg.BufferTTL)
-			}
-		}
-
-		if len(shardItems) > 0 {
-			pipe.Expire(ctx, listKey, b.cfg.BufferTTL)
-		}
-
-		if _, err := pipe.Exec(ctx); err != nil {
-			b.logger.Error("Failed to update Redis buffer with IDs", zap.Error(err))
-			return nil, fmt.Errorf("update redis list: %w", err)
-		}
+		// ASYNC ENQUEUE: We do NOT call store.UpsertItems here.
+		// The Flusher will pick up items from Redis/WAL and insert them into Postgres.
 
 		allIDs = append(allIDs, ids...)
 	}

@@ -12,6 +12,7 @@ import (
 	"mqueue/internal/config"
 	"mqueue/internal/log"
 	"mqueue/internal/metrics"
+	"mqueue/internal/prefetch"
 	"mqueue/internal/retry"
 	"mqueue/internal/store"
 	"mqueue/internal/wal"
@@ -22,7 +23,7 @@ import (
 	"go.uber.org/zap"
 )
 
-func SetupRouter(r *chi.Mux, cfg *config.Config, pgStore *store.PGStore, dlqStore *store.DLQStore, buffer *buffer.RedisBuffer, retryManager *retry.RetryManager, metrics *metrics.QueueMetrics, walManager *wal.WALManager) {
+func SetupRouter(r *chi.Mux, cfg *config.Config, pgStore *store.PGStore, dlqStore *store.DLQStore, buffer *buffer.RedisBuffer, retryManager *retry.RetryManager, metrics *metrics.QueueMetrics, walManager *wal.WALManager, prefetcher *prefetch.RedisPrefetcher) {
 	logger := log.NewLogger()
 	r.Use(httprate.Limit(100, time.Minute, httprate.WithKeyFuncs(httprate.KeyByIP)))
 	// r.Use(authMiddleware(cfg.JWTSecret, logger))
@@ -132,16 +133,23 @@ func SetupRouter(r *chi.Mux, cfg *config.Config, pgStore *store.PGStore, dlqStor
 			client := pgStore.GetRedisForShard(namespace, topic)
 			readyKey := fmt.Sprintf("mqueue:queue:%s:%s", namespace, topic)
 			redisData, err := client.LRange(r.Context(), readyKey, 0, int64(limit-1)).Result()
-			if err == nil && len(redisData) > 0 {
-				for _, data := range redisData {
-					var item store.Item
-					if json.Unmarshal([]byte(data), &item) == nil {
-						items = append(items, item)
+			if err == nil {
+				if len(redisData) > 0 {
+					for _, data := range redisData {
+						var item store.Item
+						if json.Unmarshal([]byte(data), &item) == nil {
+							items = append(items, item)
+						}
+					}
+					// Remove consumed items
+					if len(items) > 0 {
+						client.LTrim(r.Context(), readyKey, int64(len(items)), -1)
 					}
 				}
-				// Remove consumed items
-				if len(items) > 0 {
-					client.LTrim(r.Context(), readyKey, int64(len(items)), -1)
+
+				// Optimization: If queue is running low/empty, wake up prefetcher immediately
+				if len(redisData) < limit {
+					prefetcher.Trigger()
 				}
 			}
 
@@ -178,7 +186,7 @@ func SetupRouter(r *chi.Mux, cfg *config.Config, pgStore *store.PGStore, dlqStor
 				return
 			}
 			start := time.Now()
-			if err := pgStore.AckItem(r.Context(), req.ID); err != nil {
+			if err := pgStore.AckItem(r.Context(), req.Namespace, req.Topic, req.ID); err != nil {
 				logger.Error("Failed to ack item", zap.Error(err), zap.Int64("id", req.ID))
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
@@ -200,7 +208,7 @@ func SetupRouter(r *chi.Mux, cfg *config.Config, pgStore *store.PGStore, dlqStor
 				http.Error(w, "Invalid request body", http.StatusBadRequest)
 				return
 			}
-			item, err := pgStore.GetItem(r.Context(), req.ID)
+			item, err := pgStore.GetItem(r.Context(), req.Namespace, req.Topic, req.ID)
 			if err != nil {
 				logger.Error("Failed to get item for nack", zap.Error(err), zap.Int64("id", req.ID))
 				http.Error(w, err.Error(), http.StatusInternalServerError)

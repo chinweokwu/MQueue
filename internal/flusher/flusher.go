@@ -47,21 +47,26 @@ func (f *Flusher) Run(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			f.logger.Info("Flusher shutting down")
+			f.logger.Info("Flusher shutting down, performing final flush...")
+			f.flushAll(context.Background()) // Use background context as parent is canceled
+			f.logger.Info("Flusher shutdown complete")
 			return
 		case <-ticker.C:
-			// Get all active namespaces and topics
-			for namespace := range f.cfg.NamespaceQuotas {
-				topics, err := f.store.GetActiveTopics(ctx, namespace)
-				if err != nil {
-					f.logger.Error("Failed to get active topics", zap.Error(err), zap.String("namespace", namespace))
-					continue
-				}
-				for _, topic := range topics {
-					if err := f.flush(ctx, namespace, topic); err != nil {
-						f.logger.Error("Flush failed", zap.Error(err), zap.String("namespace", namespace), zap.String("topic", topic))
-					}
-				}
+			f.flushAll(ctx)
+		}
+	}
+}
+
+func (f *Flusher) flushAll(ctx context.Context) {
+	for namespace := range f.cfg.NamespaceQuotas {
+		topics, err := f.store.GetActiveTopics(ctx, namespace)
+		if err != nil {
+			f.logger.Error("Failed to get active topics", zap.Error(err), zap.String("namespace", namespace))
+			continue
+		}
+		for _, topic := range topics {
+			if err := f.flush(ctx, namespace, topic); err != nil {
+				f.logger.Error("Flush failed", zap.Error(err), zap.String("namespace", namespace), zap.String("topic", topic))
 			}
 		}
 	}

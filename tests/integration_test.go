@@ -22,7 +22,6 @@ import (
 	"github.com/redis/go-redis/v9"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
-	"github.com/testcontainers/testcontainers-go/modules/redis"
 )
 
 func TestStoreIntegration(t *testing.T) {
@@ -61,13 +60,13 @@ func TestStoreIntegration(t *testing.T) {
 	}
 
 	// Start two Redis containers
-	redisContainer1, err := redis.RunContainer(ctx, testcontainers.WithImage("redis:7"))
+	redisContainer1, err := tcRedis.RunContainer(ctx, testcontainers.WithImage("redis:7"))
 	if err != nil {
 		t.Fatalf("failed to start redis container 1: %s", err)
 	}
 	defer redisContainer1.Terminate(ctx)
 
-	redisContainer2, err := redis.RunContainer(ctx, testcontainers.WithImage("redis:7"))
+	redisContainer2, err := tcRedis.RunContainer(ctx, testcontainers.WithImage("redis:7"))
 	if err != nil {
 		t.Fatalf("failed to start redis container 2: %s", err)
 	}
@@ -126,7 +125,7 @@ func TestStoreIntegration(t *testing.T) {
 
 	logger := log.NewLogger()
 	redisBuffer := buffer.NewRedisBuffer([]*redis.Client{redisClient1, redisClient2}, cfg, pgStore, logger)
-	retryManager := retry.NewRetryManager(pgStore, dlqStore, cfg, logger)
+	_ = retry.NewRetryManager(pgStore, dlqStore, cfg, logger) // Initialize but ignore if unused in specific tests
 	prefetcher := prefetch.NewRedisPrefetcher([]*redis.Client{redisClient1, redisClient2}, pgStore, cfg, logger)
 
 	// Start prefetcher in background

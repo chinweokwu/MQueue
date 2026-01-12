@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -32,6 +33,9 @@ func main() {
 	if err != nil {
 		logger.Fatal("Failed to load config", zap.Error(err))
 	}
+	// Re-initialize logger with config (level/encoding)
+	logger = log.NewFromConfig(cfg.LogLevel, cfg.LogEncoding)
+	defer logger.Sync()
 
 	redisClients := make([]*redis.Client, len(cfg.RedisAddrs))
 	for i, addr := range cfg.RedisAddrs {
@@ -84,15 +88,30 @@ func main() {
 	leaseDaemon := lease.NewLeaseDaemon(redisClients, pgStore, cfg, logger)
 	retryManager := retry.NewRetryManager(pgStore, dlqStore, cfg, logger)
 
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer cancel()
+	// Context for background workers
+	ctx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
 
-	go flusher.Run(ctx)
-	go prefetcher.Run(ctx)
-	go leaseDaemon.Run(ctx)
-	go metrics.Run(ctx)
+	// Start Daemons
+	runDaemon := func(name string, runFunc func(context.Context)) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			logger.Info("Starting daemon", zap.String("name", name))
+			runFunc(ctx)
+			logger.Info("Daemon stopped", zap.String("name", name))
+		}()
+	}
 
+	runDaemon("Flusher", flusher.Run)
+	runDaemon("Prefetcher", prefetcher.Run)
+	runDaemon("LeaseDaemon", leaseDaemon.Run)
+	runDaemon("Metrics", metrics.Run)
+
+	// Periodic Task: Clean Empty Topics
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		ticker := time.NewTicker(time.Hour)
 		defer ticker.Stop()
 		for {
@@ -107,8 +126,26 @@ func main() {
 		}
 	}()
 
+	// Periodic Task: Cleanup Old WAL Files
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ticker := time.NewTicker(time.Hour)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if err := walManager.Cleanup(cfg.WALRetention); err != nil {
+					logger.Error("Failed to cleanup old WAL files", zap.Error(err))
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
 	r := chi.NewRouter()
-	server.SetupRouter(r, cfg, pgStore, dlqStore, redisBuffer, retryManager, metrics, walManager)
+	server.SetupRouter(r, cfg, pgStore, dlqStore, redisBuffer, retryManager, metrics, walManager, prefetcher)
 	srv := &http.Server{
 		Addr:    ":8080",
 		Handler: r,
@@ -131,6 +168,7 @@ func main() {
 		logger.Warn("TLS_CERT_FILE or TLS_KEY_FILE not set, using HTTP")
 	}
 
+	// Start Server
 	go func() {
 		if tlsConfig != nil {
 			srv.TLSConfig = tlsConfig
@@ -146,10 +184,28 @@ func main() {
 		}
 	}()
 
+	// Graceful Shutdown Listener
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+
 	logger.Info("Server started on :8080")
-	<-ctx.Done()
-	logger.Info("Shutting down")
-	if err := srv.Shutdown(context.Background()); err != nil {
+	<-stop // Wait for signal
+	logger.Info("Shutting down...")
+
+	// 1. Stop accepting new requests
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer shutdownCancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
 		logger.Error("Server shutdown failed", zap.Error(err))
+	} else {
+		logger.Info("HTTP Server stopped")
 	}
+
+	// 2. Signal background workers to stop (and flush)
+	cancel()
+
+	// 3. Wait for workers to finish
+	logger.Info("Waiting for background tasks to finish...")
+	wg.Wait()
+	logger.Info("All background tasks finished")
 }

@@ -3,6 +3,7 @@ package retry
 import (
 	"context"
 	"fmt"
+	"math/rand/v2"
 	"time"
 
 	"mqueue/internal/config"
@@ -46,8 +47,15 @@ func (r *RetryManager) RetryItem(ctx context.Context, item store.Item, lastError
 		return nil
 	}
 
-	// Apply exponential backoff
-	backoff := r.cfg.RetryBackoff * time.Duration(1<<item.Retries)
+	// Apply exponential backoff with jitter
+	// Base: 2^retries * initial (e.g. 1s, 2s, 4s...)
+	baseBackoff := r.cfg.RetryBackoff * time.Duration(1<<item.Retries)
+
+	// Jitter: +/- 20% to prevent thundering herd
+	// rand.Float64() returns [0.0, 1.0)
+	jitterFactor := 0.8 + (rand.Float64() * 0.4) // Result: [0.8, 1.2)
+	backoff := time.Duration(float64(baseBackoff) * jitterFactor)
+
 	item.DeliverAfter = time.Now().Add(backoff)
 	item.Status = "ready"
 	item.LeaseExpiresAt = nil

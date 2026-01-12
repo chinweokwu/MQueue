@@ -80,19 +80,42 @@ func (w *WALManager) rotateFile(shardID int) error {
 	w.logFiles[shardID] = f
 	w.fileSizes[shardID] = 0
 
-	// Clean up old WAL files
-	files, err := filepath.Glob(filepath.Join(shardDir, "wal-*.log"))
-	if err != nil {
-		return fmt.Errorf("list WAL files for shard %d: %w", shardID, err)
-	}
-	if len(files) > w.maxFiles {
-		for _, oldFile := range files[:len(files)-w.maxFiles] {
-			if err := os.Remove(oldFile); err != nil {
-				return fmt.Errorf("remove old WAL file %s: %w", oldFile, err)
+	return nil
+}
+
+// Cleanup removes WAL files older than the specified duration.
+func (w *WALManager) Cleanup(retention time.Duration) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	cutoff := time.Now().Add(-retention)
+
+	for i := 0; i < w.numShards; i++ {
+		shardDir := filepath.Join(w.baseDir, fmt.Sprintf("shard%d", i))
+		files, err := filepath.Glob(filepath.Join(shardDir, "wal-*.log"))
+		if err != nil {
+			return fmt.Errorf("list WAL files for shard %d: %w", i, err)
+		}
+
+		for _, file := range files {
+			filename := filepath.Base(file)
+			// expected format: wal-20060102T150405.log
+			if len(filename) < 19 {
+				continue
+			}
+			timeStr := filename[4 : len(filename)-4] // strip "wal-" and ".log"
+			t, err := time.Parse("20060102T150405", timeStr)
+			if err != nil {
+				continue // skip malformed files
+			}
+
+			if t.Before(cutoff) {
+				if err := os.Remove(file); err != nil {
+					return fmt.Errorf("remove old WAL file %s: %w", file, err)
+				}
 			}
 		}
 	}
-
 	return nil
 }
 

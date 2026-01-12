@@ -1,287 +1,128 @@
 # MQueue (Distributed, Sharded, Priority Message Queue)
 
-mqueue is a high-performance, distributed, sharded priority message queue written in **Go**, designed for **at-least-once delivery**, **low-latency dequeue**, **durability**, and **multi-tenancy**.
+**mqueue** is a high-performance, distributed, sharded priority message queue written in **Go**. It is designed for **massive write throughput**, **strict priority ordering**, and **at-least-once delivery**.
 
-Inspired by systems like **Facebook’s FOQS**, mqueue combines:
-- **PostgreSQL** — durable, sharded persistence
-- **Redis** — buffering and fast-path serving
-- **Write-Ahead Log (WAL)** — crash recovery
-
-It is ideal for background job processing, lead enrichment pipelines, task scheduling, and any workflow requiring reliable, ordered, delayed message delivery.
+mqueue is modeled after **Facebook's FOQS** (Facebook Ordered Queueing Service). It combines the durability of **PostgreSQL** with the speed of **Redis** and the safety of a **Write-Ahead Log (WAL)**.
 
 ---
 
-## Key Features
+## 🚀 Key Features
 
-### Core Capabilities
-- **Horizontal Sharding**  
-  Automatic sharding across multiple PostgreSQL instances using an FNV-32 hash of `namespace + topic`.
+### ⚡ Async Enqueue & High Throughput
+- **Non-Blocking Writes**: Enqueue requests are written to Redis (buffer) and WAL (durability) and acknowledged *immediately*.
+- **Snowflake IDs**: Generates unique, time-ordered 64-bit IDs application-side, avoiding database round-trips for ID generation.
+- **Bulk Flushing**: Background flushers batch-insert items into PostgreSQL, maximizing database throughput.
 
-- **Low-Latency Dequeue**  
-  Hot topics are served directly from Redis ready queues. Cold topics fall back to PostgreSQL leasing.
+### 🛡️ Reliability & Durability
+- **WAL-Based Recovery**: Every message is persisted to a local Write-Ahead Log before ack. If the server crashes, items are recovered on startup.
+- **Graceful Shutdown**: Ensures all in-flight memory buffers are drained to the database before the application exits.
+- **Circuit Breakers**: Automatically stops writing to a database shard if it becomes unhealthy, preventing cascading failures.
+- **Strict Sharding**: Routes writes based on `(namespace, topic)` hash. Fails fast if the target shard is unavailable to prevent data inconsistency.
 
-- **Strict Priority & Delayed Delivery**  
-  Messages are dequeued by priority (lower number = higher priority) and `deliver_after` timestamp.
+### 🎯 Priority & Scheduling
+- **Priority Queues**: Items are ordered by `priority` (asc) and then `deliver_after` timestamp.
+- **Delayed Delivery**: Native support for scheduling tasks in the future.
+- **Prefetching**: Background prefetchers move high-priority items from disk (Postgres) to memory (Redis) to ensure low-latency dequeue.
 
-- **At-Least-Once Delivery**  
-  Lease-based visibility timeout with automatic renewal and redelivery on failure.
+### 📦 Multi-Tenancy
+- **Namespaces**: Logical isolation for different teams or customers.
+- **Quotas**: Configurable rate limits (enqueues/minute) per namespace.
+- **Dynamic Topics**: Topics are created on-the-fly; no manual provisioning required.
 
-- **Retries & Dead Letter Queue (DLQ)**  
-  Configurable retries with exponential backoff. Messages exceeding max retries are moved to DLQ.
-
-- **Idempotency Support**  
-  Per-namespace idempotency keys with deduplication across Redis and PostgreSQL.
-
-- **Multi-Tenancy & Rate Limiting**  
-  Isolated namespaces with configurable per-minute enqueue quotas.
-
-### Reliability & Operations
-- **Durability & Crash Recovery**  
-  Per-shard WAL with automatic recovery on startup.
-
-- **Observability**  
-  Native Prometheus metrics: enqueue/dequeue/ack/nack rates, buffer depth, ready queue depth, shard health.
-
-- **Security**  
-  JWT authentication, TLS support, and IP-based rate limiting.
-
-- **High Availability Ready**  
-  Redis replication and Sentinel support.
-
-- **Dynamic Topics**  
-  Topics are created automatically on first use.
+### 🔍 Observability
+- **Structured Logging**: Configurable JSON/Console logging via Zap.
+- **Prometheus Metrics**: Built-in `/metrics` endpoint with counters for enqueue, dequeue, ack, nack, and queue depth.
+- **Tracing Context**: Ready for OpenTelemetry integration.
 
 ---
 
-## When to Use mqueue
+## Architecture
 
-Use **mqueue** when you need:
+![Architecture](https://github.com/user-attachments/assets/beb639a6-04b4-4221-8c02-81740a1be6d3)
 
-### ✅ Strict Priority Processing
-- Jobs **must** be processed in priority order
-- Higher-priority tasks must always preempt lower-priority ones
-
-### ✅ Delayed & Scheduled Jobs
-- Native `deliver_after` support
-- No need for cron hacks or polling schedulers
-
-### ✅ At-Least-Once Semantics
-- You can tolerate duplicate delivery
-- Consumers are idempotent or use idempotency keys
-
-### ✅ Database-Backed Durability
-- Messages must survive crashes and restarts
-- PostgreSQL-backed persistence is preferred over in-memory brokers
-
-### ✅ Multi-Tenant Queues
-- Isolated namespaces for different customers or teams
-- Per-namespace rate limits and quotas
-
-### ✅ Operational Simplicity
-- You want **Postgres + Redis**, not a large distributed streaming platform
-- Easier debugging with SQL visibility into queue state
-
-### Common Use Cases
-- Background job processing
-- Lead ingestion & enrichment pipelines
-- Payment or billing workflows
-- Email, SMS, and notification dispatch
-- Task scheduling with retries and DLQ
-- SaaS internal queues per customer/tenant
+1.  **Enqueue**: 
+    - Client -> HTTP API -> Snowflake Generator -> Redis Buffer + WAL.
+2.  **Persist**: 
+    - Flusher Daemon -> Drains Redis Buffer -> Bulk Insert to PostgreSQL Shard.
+3.  **Prepare**: 
+    - Prefetcher Daemon -> Scans PostgreSQL for highest priority ready items -> Pushes to Redis Ready Queue.
+4.  **Dequeue**: 
+    - Client -> HTTP API -> Pop from Redis Ready Queue.
+5.  **Clean Up**: 
+    - Client -> HTTP API -> Ack (Delete from Postgres) / Nack (Retry later).
 
 ---
 
-## When NOT to Use mqueue
+## 🛠️ Configuration
 
-Avoid **mqueue** if your problem looks like any of the following:
+Configuration is loaded from `.env` or environment variables.
 
-### ❌ Event Streaming / Analytics Pipelines
-- You need to replay events from weeks or months ago
-- Multiple consumer groups need independent offsets  
-➡️ Use **Kafka / Pulsar**
-
-### ❌ Exactly-Once Delivery Required
-- Your system **cannot tolerate duplicates**
-- Exactly-once semantics are mandatory  
-➡️ Use transactional systems or idempotent consumers
-
-### ❌ Ultra-High Throughput (Millions/sec)
-- You need extreme throughput over ordering guarantees
-- Disk-backed SQL writes become a bottleneck  
-➡️ Use Kafka or log-based systems
-
-### ❌ Fan-Out Broadcast Messaging
-- Every message must go to many consumers
-- Pub/Sub-style distribution  
-➡️ Use Kafka, NATS, or cloud Pub/Sub
-
-### ❌ Ephemeral / Fire-and-Forget Tasks
-- Messages don’t matter if lost
-- No retries, no durability needed  
-➡️ Use Redis lists, in-memory queues, or task runners
+| Variable | Description | Default |
+| :--- | :--- | :--- |
+| `DATABASE_URLS` | Comma-separated Postgres connection strings (Shards) | **Required** |
+| `REDIS_ADDRS` | Comma-separated Redis addresses | **Required** |
+| `REDIS_PASSWORD`| Redis password | `""` |
+| `WAL_DIR` | Directory for Write-Ahead Log files | **Required** |
+| `MQUEUE_NODE_ID`| Unique integer ID (0-1023) for Snowflake generator | `1` |
+| `LOG_LEVEL` | `debug`, `info`, `warn`, `error` | `info` |
+| `LOG_ENCODING` | `json` (prod), `console` (dev) | `json` |
+| `JWT_SECRET` | Secret for verifying auth tokens | **Required** |
+| `NAMESPACE_QUOTAS`| Rate limits (e.g. `tenant-a:1000,tenant-b:500`) | `""` |
 
 ---
 
-## Architecture Overview
+## 🏃 Quick Start
 
-mqueue blends durability, speed, and recoverability by combining PostgreSQL, Redis, and WAL-based recovery.
-
-(<img width="1414" height="919" alt="image" src="https://github.com/user-attachments/assets/beb639a6-04b4-4221-8c02-81740a1be6d3" />)
-
-**Background Daemons**:
-- **Flusher** → Drains Redis buffer → PostgreSQL (with circuit breaker)
-- **Prefetcher** → Leases items → Priority heap merge → Redis Ready Queue
-- **Lease Daemon** → Renews active leases in Redis + PostgreSQL
-
-## Installation & Quick Start (Docker Compose)
-
-### Prerequisites
-- Docker & Docker Compose
-- Go 1.24 (optional for local development)
----
-
-### 1. Clone the Repository
-
+### 1. Run with Docker Compose
 ```bash
-git clone https://github.com/yourusername/mqueue.git
-cd mqueue
-````
-### 2. Generate TLS Certificates (Recommended for Production)
-`````Bash
-mkdir -p mqueue-certs
-openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
-  -keyout mqueue-certs/key.pem \
-  -out mqueue-certs/cert.pem \
-  -subj "/CN=localhost"
-`````
-#### 3. Create .env File (Optional but Recommended)
-`````Bash
-envDATABASE_URLS=
-REDIS_ADDRS=
-REDIS_PASSWORD=
-WAL_DIR=
-JWT_SECRET=
-NAMESPACE_QUOTAS=
-TLS_CERT_FILE=/app/mqueue-certs/cert.pem
-TLS_KEY_FILE=/app/mqueue-certs/key.pem
-`````
-### 4. Start the System
-```Bash
 docker-compose up --build -d
-Wait ~60 seconds for services to initialise.
-````
-### 5. Verify It's Running
-````Bash
-##Public health check
+```
+
+### 2. Verify Health
+```bash
 curl -k https://localhost:8080/health
-# → OK
-`````
-### Metrics
-```Bash
-curl -k https://localhost:2112/metrics | grep mqueue_shard_health
-# should show 1 for all shards
-````
+# Output: OK
+```
 
-#### Authentication
-All endpoints except /health require a valid JWT token in the header:
-````text
-Authorisation: Bearer <token>
-Generate a JWT Token
-Use https://jwt.io
-
-Algorithm: HS256
-Secret: fYXSb6rYIpxCKOvIv5hKWKph+2B//Wie9kV7sj6Ot44=
-Payload (example):
-
-JSON{
-  "sub": "test-user",
-  "exp": 1930000000
-}
-`````
-Copy the generated token.
-API Examples
-Replace YOUR_JWT with your generated token.
-### Enqueue Messages
-````Bash
+### 3. Enqueue a Message
+```bash
 curl -k -X POST https://localhost:8080/enqueue \
-  -H "Authorisation: Bearer YOUR_JWT" \
+  -H "Authorization: Bearer <YOUR_JWT>" \
   -H "Content-Type: application/json" \
   -d '[{
     "namespace": "default",
-    "topic": "leads",
+    "topic": "test-topic",
     "priority": 1,
-    "payload": "eyJuYW1lIjoiSm9obiBEb2UifQ==",  // base64: {"name":"John Doe"}
-    "deliver_after": "2025-12-25T10:00:00Z"
+    "payload": "SGVsbG8gV29ybGQ=", 
+    "deliver_after": "2024-01-01T12:00:00Z"
   }]'
- # Returns an array of assigned message IDs.
-````
-### Dequeue Messages
-````Bash
-curl -k "https://localhost:8080/dequeue?namespace=default&topic=leads&limit=10" \
-  -H "Authorisation: Bearer YOUR_JWT"
-# Returns up to limit messages.
-`````
-### Ack (Successful Processing)
-`````Bash
-curl -k -X POST https://localhost:8080/ack \
-  -H "Authorisation: Bearer YOUR_JWT" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "id": 123456789012345678,
-    "namespace": "default",
-    "topic": "leads"
-  }'
-```````
-### Nack (Failure → Retry)
-````Bash
-curl -k -X POST https://localhost:8080/nack \
-  -H "Authorisation: Bearer YOUR_JWT" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "id": 123456789012345678,
-    "namespace": "default",
-    "topic": "leads",
-    "error": "Processing failed"
-  }'
-# After MaxRetries (default 3), the message moves to DLQ.
-`````
-### View Dead Letter Queue
-```Bash
-curl -k "https://localhost:8080/dlq?namespace=default&topic=leads&limit=10" \
-  -H "Authorisation: Bearer YOUR_JWT"
-````
-### Delete from DLQ
-```Bash
-curl -k -X POST https://localhost:8080/dlq/delete \
-  -H "Authorisation: Bearer YOUR_JWT" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "id": 123456789012345678,
-    "namespace": "default",
-    "topic": "leads"
-  }'
-````
-### Monitoring
-```bash
-Metrics End
-point: https://localhost:2112/metrics (TLS)
-Key metrics:
-mqueue_buffer_queue_depth — items waiting to be flushed
-mqueue_ready_queue_depth — items in fast path
-mqueue_enqueue_total, mqueue_dequeue_total
-mqueue_shard_health — 1 = healthy
 ```
-### Development
-```Bash
-make build              # Build binary
-make run                # Run locally
-make test               # Unit tests
-make integration-test   # Integration tests (requires Docker)
-````
+
+### 4. Dequeue a Message
+```bash
+curl -k "https://localhost:8080/dequeue?namespace=default&topic=test-topic&limit=1" \
+  -H "Authorization: Bearer <YOUR_JWT>"
+```
+
+### 5. Acknowledge (ACK)
+```bash
+curl -k -X POST https://localhost:8080/ack \
+  -H "Authorization: Bearer <YOUR_JWT>" \
+  -d '{
+    "id": 174568912344,
+    "namespace": "default",
+    "topic": "test-topic"
+  }'
+```
+
+---
+
+## ⚠️ "Production Ready" Notes
+
+*   **Sharding**: MQueue uses `hash(namespace + topic)` to pick a shard. This allows high throughput but means a single topic cannot exceed the write capacity of one Postgres instance.
+*   **Failover**: If a shard goes down, writes to topics on that shard will **fail** (return 500) to preserve data consistency. We do not support "spillover" writes to avoid orphaned data.
+*   **WAL**: Ensure `WAL_DIR` is mounted on a persistent volume in production.
+
 ## License
+
 MIT License
-
-
-
-
-

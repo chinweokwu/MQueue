@@ -1,20 +1,36 @@
-# Build stage
-FROM golang:1.24 AS builder
+# Build Stage
+FROM golang:1.24-alpine AS builder
+
 WORKDIR /app
+
+# Install build dependencies
+RUN apk add --no-cache git make
+
+# Copy module files first (caching)
 COPY go.mod go.sum ./
 RUN go mod download
-COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -o mqueue ./main.go
 
-# Final stage
-FROM alpine:latest
-RUN apk add --no-cache ca-certificates
+# Copy source code
+COPY . .
+
+# Build distinct binaries
+# CGO_ENABLED=0 for static binaries
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o mqueue ./main.go
+
+# Production Stage
+FROM gcr.io/distroless/static-debian12 AS production
+
 WORKDIR /app
+
+# Copy binary from builder
 COPY --from=builder /app/mqueue .
-COPY .env ./
-COPY mqueue-certs/cert.pem ./mqueue-certs/cert.pem
-COPY mqueue-certs/key.pem ./mqueue-certs/key.pem
-RUN mkdir -p /app/wal/shard0 /app/wal/shard1
-RUN touch /app/wal/shard0/wal.log /app/wal/shard1/wal.log
-EXPOSE 8080 2112
-CMD ["./mqueue"]
+
+# Expose HTTP port
+EXPOSE 8080
+# Expose Metrics port
+EXPOSE 2112
+
+# Use non-root user (distroless default)
+USER nonroot:nonroot
+
+ENTRYPOINT ["./mqueue"]

@@ -34,6 +34,10 @@ type Config struct {
 	DeliveryMode      string
 	JWTSecret         string
 	WorkerID          string
+	NodeID            int64
+	LogLevel          string
+	LogEncoding       string
+	WALRetention      time.Duration
 }
 
 func Load() (*Config, error) {
@@ -43,6 +47,12 @@ func Load() (*Config, error) {
 		logger := log.NewLogger()
 		logger.Warn("Failed to load .env file", zap.Error(err))
 	}
+
+	nodeIDStr := os.Getenv("MQUEUE_NODE_ID")
+	if nodeIDStr == "" {
+		nodeIDStr = "1"
+	}
+	nodeID, _ := strconv.ParseInt(nodeIDStr, 10, 64)
 
 	logger := log.NewLogger()
 	cfg := &Config{
@@ -66,6 +76,18 @@ func Load() (*Config, error) {
 		DeliveryMode:      os.Getenv("DELIVERY_MODE"),
 		JWTSecret:         os.Getenv("JWT_SECRET"),
 		WorkerID:          os.Getenv("WORKER_ID"),
+		NodeID:            nodeID,
+		LogLevel:          getEnv("LOG_LEVEL", "info"),
+		LogEncoding:       getEnv("LOG_ENCODING", "json"),
+		WALRetention:      24 * time.Hour,
+	}
+
+	if retentionStr := os.Getenv("WAL_RETENTION"); retentionStr != "" {
+		if d, err := time.ParseDuration(retentionStr); err == nil {
+			cfg.WALRetention = d
+		} else {
+			logger.Warn("Invalid WAL_RETENTION format, using default", zap.Error(err))
+		}
 	}
 
 	if len(cfg.DatabaseURLs) == 0 || cfg.DatabaseURLs[0] == "" {
@@ -111,4 +133,11 @@ func Load() (*Config, error) {
 
 	logger.Info("Config loaded successfully")
 	return cfg, nil
+}
+
+func getEnv(key, fallback string) string {
+	if value, ok := os.LookupEnv(key); ok {
+		return value
+	}
+	return fallback
 }

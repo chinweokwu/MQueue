@@ -19,24 +19,26 @@ import (
 
 // RedisPrefetcher manages prefetching items from PostgreSQL and caching them in Redis.
 type RedisPrefetcher struct {
-	clients   []*redis.Client
-	pgStore   *store.PGStore
-	cfg       *config.Config
-	logger    *log.Logger
-	demand    map[string]int
-	demandMu  sync.RWMutex
-	leaseChan chan store.Item
+	clients     []*redis.Client
+	pgStore     *store.PGStore
+	cfg         *config.Config
+	logger      *log.Logger
+	demand      map[string]int
+	demandMu    sync.RWMutex
+	leaseChan   chan store.Item
+	triggerChan chan struct{} // Signal to wake up prefetcher immediately
 }
 
 // NewRedisPrefetcher initializes a new RedisPrefetcher.
 func NewRedisPrefetcher(clients []*redis.Client, pgStore *store.PGStore, cfg *config.Config, logger *log.Logger) *RedisPrefetcher {
 	return &RedisPrefetcher{
-		clients:   clients,
-		pgStore:   pgStore,
-		cfg:       cfg,
-		logger:    logger,
-		demand:    make(map[string]int),
-		leaseChan: make(chan store.Item, cfg.PrefetchBatchSize),
+		clients:     clients,
+		pgStore:     pgStore,
+		cfg:         cfg,
+		logger:      logger,
+		demand:      make(map[string]int),
+		leaseChan:   make(chan store.Item, cfg.PrefetchBatchSize),
+		triggerChan: make(chan struct{}, 1),
 	}
 }
 
@@ -46,6 +48,15 @@ func (p *RedisPrefetcher) Run(ctx context.Context) {
 	go p.merge(ctx)
 	<-ctx.Done()
 	p.logger.Info("Prefetcher shutting down")
+}
+
+// Trigger wakes up the prefetcher immediately.
+// It is non-blocking; if already triggered, it does nothing.
+func (p *RedisPrefetcher) Trigger() {
+	select {
+	case p.triggerChan <- struct{}{}:
+	default:
+	}
 }
 
 // UpdateDemand updates the demand rate for a specific topic.
@@ -60,53 +71,61 @@ func (p *RedisPrefetcher) prefetch(ctx context.Context) {
 	ticker := time.NewTicker(p.cfg.PrefetchInterval)
 	defer ticker.Stop()
 
+	runPrefetch := func() {
+		for namespace := range p.cfg.NamespaceQuotas {
+			topics, err := p.pgStore.GetActiveTopics(ctx, namespace)
+			if err != nil {
+				p.logger.Error("Failed to get active topics", zap.Error(err), zap.String("namespace", namespace))
+				continue
+			}
+			for _, topic := range topics {
+				fullKey := namespace + ":" + topic
+				p.demandMu.RLock()
+				batchSize := p.demand[fullKey]
+				if batchSize == 0 {
+					batchSize = p.cfg.PrefetchBatchSize
+				}
+				p.demandMu.RUnlock()
+
+				items, err := p.pgStore.LeaseItems(ctx, namespace, topic, p.cfg.WorkerID, batchSize, p.cfg.LeaseTTL)
+				if err != nil {
+					p.logger.Error("Failed to lease items", zap.Error(err))
+					continue
+				}
+
+				client := p.pgStore.GetRedisForShard(namespace, topic)
+				for _, item := range items {
+					data, err := json.Marshal(item)
+					if err != nil {
+						p.logger.Error("Failed to marshal item", zap.Error(err))
+						continue
+					}
+
+					key := fmt.Sprintf("mqueue:lease:%d", item.ID)
+					if err := client.Set(ctx, key, data, p.cfg.LeaseTTL).Err(); err != nil {
+						p.logger.Error("Failed to set lease in Redis", zap.Error(err))
+						continue
+					}
+					if err := client.SAdd(ctx, fmt.Sprintf("mqueue:leases:%s:%s", namespace, topic), key).Err(); err != nil {
+						p.logger.Error("Failed to add lease to set", zap.Error(err))
+						continue
+					}
+					p.leaseChan <- item
+				}
+			}
+		}
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			for namespace := range p.cfg.NamespaceQuotas {
-				topics, err := p.pgStore.GetActiveTopics(ctx, namespace)
-				if err != nil {
-					p.logger.Error("Failed to get active topics", zap.Error(err), zap.String("namespace", namespace))
-					continue
-				}
-				for _, topic := range topics {
-					fullKey := namespace + ":" + topic
-					p.demandMu.RLock()
-					batchSize := p.demand[fullKey]
-					if batchSize == 0 {
-						batchSize = p.cfg.PrefetchBatchSize
-					}
-					p.demandMu.RUnlock()
-
-					items, err := p.pgStore.LeaseItems(ctx, namespace, topic, p.cfg.WorkerID, batchSize, p.cfg.LeaseTTL)
-					if err != nil {
-						p.logger.Error("Failed to lease items", zap.Error(err))
-						continue
-					}
-
-					client := p.pgStore.GetRedisForShard(namespace, topic)
-					for _, item := range items {
-						data, err := json.Marshal(item)
-						if err != nil {
-							p.logger.Error("Failed to marshal item", zap.Error(err))
-							continue
-						}
-
-						key := fmt.Sprintf("mqueue:lease:%d", item.ID)
-						if err := client.Set(ctx, key, data, p.cfg.LeaseTTL).Err(); err != nil {
-							p.logger.Error("Failed to set lease in Redis", zap.Error(err))
-							continue
-						}
-						if err := client.SAdd(ctx, fmt.Sprintf("mqueue:leases:%s:%s", namespace, topic), key).Err(); err != nil {
-							p.logger.Error("Failed to add lease to set", zap.Error(err))
-							continue
-						}
-						p.leaseChan <- item
-					}
-				}
-			}
+			runPrefetch()
+		case <-p.triggerChan:
+			// reset ticker to prevent immediate double-run
+			ticker.Reset(p.cfg.PrefetchInterval)
+			runPrefetch()
 		}
 	}
 }

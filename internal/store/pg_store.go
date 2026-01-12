@@ -73,26 +73,26 @@ func (s *PGStore) GetShardID(namespace, topic string) int {
 	return int(h.Sum32() % uint32(len(s.dbs)))
 }
 
-func (s *PGStore) getDBForShard(namespace, topic string) *sql.DB {
+func (s *PGStore) getDBForShard(namespace, topic string) (*sql.DB, error) {
 	shardID := s.GetShardID(namespace, topic)
 	s.healthyMu.RLock()
-	if s.healthyShards[shardID] {
-		s.healthyMu.RUnlock()
-		return s.dbs[shardID]
-	}
+	isHealthy := s.healthyShards[shardID]
 	s.healthyMu.RUnlock()
-	return s.dbs[(shardID+1)%len(s.dbs)]
+
+	if !isHealthy {
+		return nil, fmt.Errorf("shard %d is unhealthy", shardID)
+	}
+	return s.dbs[shardID], nil
 }
 
 func (s *PGStore) GetRedisForShard(namespace, topic string) *redis.Client {
 	shardID := s.GetShardID(namespace, topic)
-	s.healthyMu.RLock()
-	if s.healthyShards[shardID] {
-		s.healthyMu.RUnlock()
-		return s.redis[shardID]
-	}
-	s.healthyMu.RUnlock()
-	return s.redis[(shardID+1)%len(s.redis)]
+	// Redis doesn't have the same strict data ownership issues as DB,
+	// but for consistency, we could stick to the primary.
+	// However, keeping fallback here might be acceptable if Redis is just a cache.
+	// But given the "Async Enqueue" ensures strictly one path, let's keep it simple
+	// and stick to the primary for now to avoid confusion.
+	return s.redis[shardID]
 }
 
 func (s *PGStore) monitorShards() {
@@ -128,8 +128,11 @@ func (s *PGStore) UpsertItems(ctx context.Context, items []Item) ([]int64, error
 		}
 	}
 
-	db := s.getDBForShard(items[0].Namespace, items[0].Topic)
-	shardID := s.GetShardID(items[0].Namespace, items[0].Topic)
+	db, err := s.getDBForShard(items[0].Namespace, items[0].Topic)
+	if err != nil {
+		return nil, fmt.Errorf("get db: %w", err)
+	}
+	// shardID := s.GetShardID(items[0].Namespace, items[0].Topic) // Not needed for encoding
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("begin tx: %w", err)
@@ -139,9 +142,10 @@ func (s *PGStore) UpsertItems(ctx context.Context, items []Item) ([]int64, error
 	var ids []int64
 	for _, item := range items {
 		var rawID int64
+		// Insert with explicit ID
 		err := tx.QueryRowContext(ctx, `
-               INSERT INTO items (namespace, topic, idempotency_key, priority, payload, metadata, deliver_after, status, retries, created_at, updated_at)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+               INSERT INTO items (id, namespace, topic, idempotency_key, priority, payload, metadata, deliver_after, status, retries, created_at, updated_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
                ON CONFLICT (namespace, idempotency_key) DO UPDATE
                SET priority = EXCLUDED.priority,
                    payload = EXCLUDED.payload,
@@ -150,13 +154,12 @@ func (s *PGStore) UpsertItems(ctx context.Context, items []Item) ([]int64, error
                    status = EXCLUDED.status,
                    updated_at = EXCLUDED.updated_at
                RETURNING id
-           `, item.Namespace, item.Topic, item.IdempotencyKey, item.Priority, item.Payload, item.Metadata,
+           `, item.ID, item.Namespace, item.Topic, item.IdempotencyKey, item.Priority, item.Payload, item.Metadata,
 			item.DeliverAfter, item.Status, item.Retries, item.CreatedAt, item.UpdatedAt).Scan(&rawID)
 		if err != nil {
 			return nil, fmt.Errorf("upsert item: %w", err)
 		}
-		encodedID := int64(shardID)<<56 | rawID
-		ids = append(ids, encodedID)
+		ids = append(ids, rawID)
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit tx: %w", err)
@@ -172,6 +175,10 @@ func (s *PGStore) countEnqueuesLastMinute(ctx context.Context, namespace string)
                SELECT COUNT(*) FROM items
                WHERE namespace = $1 AND created_at >= $2
            `, namespace, time.Now().Add(-1*time.Minute)).Scan(&shardCount)
+		// If a shard is down, we might fail or partial count.
+		// For quotas, failing open (ignoring down shard) or failing closed?
+		// Let's just log error and continue if we want robustness, or fail strict.
+		// For now, fail strict as per request to avoid inconsistencies.
 		if err != nil {
 			return 0, err
 		}
@@ -181,7 +188,10 @@ func (s *PGStore) countEnqueuesLastMinute(ctx context.Context, namespace string)
 }
 
 func (s *PGStore) LeaseItems(ctx context.Context, namespace, topic, leaseOwner string, limit int, leaseDuration time.Duration) ([]Item, error) {
-	db := s.getDBForShard(namespace, topic)
+	db, err := s.getDBForShard(namespace, topic)
+	if err != nil {
+		return nil, fmt.Errorf("get db: %w", err)
+	}
 	rows, err := db.QueryContext(ctx, `
            UPDATE items
            SET lease_expires_at = $1, lease_owner = $2
@@ -202,7 +212,6 @@ func (s *PGStore) LeaseItems(ctx context.Context, namespace, topic, leaseOwner s
 	}
 	defer rows.Close()
 
-	shardID := s.GetShardID(namespace, topic)
 	var items []Item
 	for rows.Next() {
 		var item Item
@@ -212,21 +221,20 @@ func (s *PGStore) LeaseItems(ctx context.Context, namespace, topic, leaseOwner s
 		if err != nil {
 			return nil, fmt.Errorf("scan item: %w", err)
 		}
-		item.ID = int64(shardID)<<56 | item.ID
+		// IDs are global, no encoding
 		items = append(items, item)
 	}
 	return items, nil
 }
 
-func (s *PGStore) AckItem(ctx context.Context, itemID int64) error {
-	shardID := int(itemID >> 56)
-	if shardID >= len(s.dbs) {
-		return fmt.Errorf("invalid shard ID in item ID %d", itemID)
+func (s *PGStore) AckItem(ctx context.Context, namespace, topic string, itemID int64) error {
+	db, err := s.getDBForShard(namespace, topic)
+	if err != nil {
+		return fmt.Errorf("get db: %w", err)
 	}
-	db := s.dbs[shardID]
-	_, err := db.ExecContext(ctx, `
+	_, err = db.ExecContext(ctx, `
            DELETE FROM items WHERE id = $1
-       `, itemID&0x00FFFFFFFFFFFFFF)
+       `, itemID)
 	if err != nil {
 		return fmt.Errorf("ack item: %w", err)
 	}
@@ -236,38 +244,51 @@ func (s *PGStore) AckItem(ctx context.Context, itemID int64) error {
 	return nil
 }
 
-func (s *PGStore) GetItem(ctx context.Context, itemID int64) (Item, error) {
-	shardID := int(itemID >> 56)
-	if shardID >= len(s.dbs) {
-		return Item{}, fmt.Errorf("invalid shard ID in item ID %d", itemID)
+func (s *PGStore) GetItem(ctx context.Context, namespace, topic string, itemID int64) (Item, error) {
+	db, err := s.getDBForShard(namespace, topic)
+	if err != nil {
+		return Item{}, fmt.Errorf("get db: %w", err)
 	}
-	db := s.dbs[shardID]
 	var item Item
-	err := db.QueryRowContext(ctx, `
+	err = db.QueryRowContext(ctx, `
            SELECT id, namespace, topic, idempotency_key, priority, payload, metadata, deliver_after, lease_expires_at, lease_owner, ttl, status, retries, created_at, updated_at, first_failed_at
            FROM items WHERE id = $1
-       `, itemID&0x00FFFFFFFFFFFFFF).Scan(&item.ID, &item.Namespace, &item.Topic, &item.IdempotencyKey, &item.Priority, &item.Payload, &item.Metadata, &item.DeliverAfter, &item.LeaseExpiresAt, &item.LeaseOwner, &item.TTL, &item.Status, &item.Retries, &item.CreatedAt, &item.UpdatedAt, &item.FirstFailedAt)
+       `, itemID).Scan(&item.ID, &item.Namespace, &item.Topic, &item.IdempotencyKey, &item.Priority, &item.Payload, &item.Metadata, &item.DeliverAfter, &item.LeaseExpiresAt, &item.LeaseOwner, &item.TTL, &item.Status, &item.Retries, &item.CreatedAt, &item.UpdatedAt, &item.FirstFailedAt)
 	if err != nil {
 		return Item{}, fmt.Errorf("get item: %w", err)
 	}
-	item.ID = itemID
 	return item, nil
 }
 
 func (s *PGStore) MoveToDLQ(ctx context.Context, item Item, lastError string) error {
-	db := s.getDBForShard(item.Namespace, item.Topic)
-	_, err := db.ExecContext(ctx, `
+	db, err := s.getDBForShard(item.Namespace, item.Topic)
+	if err != nil {
+		return fmt.Errorf("get db: %w", err)
+	}
+
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	_, err = tx.ExecContext(ctx, `
            INSERT INTO dead_letter (original_id, namespace, topic, idempotency_key, priority, payload, metadata, last_error, retries, first_failed_at, moved_at)
            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
        `, item.ID, item.Namespace, item.Topic, item.IdempotencyKey, item.Priority, item.Payload, item.Metadata, lastError, item.Retries, item.FirstFailedAt, time.Now())
 	if err != nil {
 		return fmt.Errorf("insert into DLQ: %w", err)
 	}
-	_, err = db.ExecContext(ctx, `
+
+	_, err = tx.ExecContext(ctx, `
            DELETE FROM items WHERE id = $1
-       `, item.ID&0x00FFFFFFFFFFFFFF)
+       `, item.ID)
 	if err != nil {
 		return fmt.Errorf("delete from items: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit tx: %w", err)
 	}
 	return nil
 }
