@@ -126,7 +126,7 @@ sequenceDiagram
 **Goal:** Serve high-priority items instantly from memory, avoiding random DB reads on every request.
 
 1.  **Prefetching (Background):**
-    *   The `Prefetcher` daemon monitors active topics.
+    *   The `Prefetcher` daemon monitors active topics by unioning Redis active sets and Postgres data.
     *   It runs a query on the PostgreSQL shard:
         ```sql
         SELECT ... FROM items 
@@ -136,11 +136,11 @@ sequenceDiagram
         FOR UPDATE SKIP LOCKED
         ```
     *   It sets `lease_expires_at` (locks the items).
-    *   It pushes these items into a Redis List (`mqueue:queue:{namespace}:{topic}`).
+    *   It pushes these items into the **Right** of a Redis List (`RPUSH` to `mqueue:queue:{namespace}:{topic}`).
 2.  **Dequeueing:**
     *   Client sends `GET /dequeue`.
     *   Accesses the Redis List directly (`LPOP`).
-    *   *Result:* extremely fast dequeue latency (Redis speed).
+    *   *Result:* extremely fast dequeue latency (Redis speed) with **FIFO** consumption of the prioritized block.
     *   If Redis is empty, it falls back to a direct DB lease (slow path), ensuring correctness.
 
 ### 3.3. Completion (Ack/Nack)
@@ -246,7 +246,7 @@ Sharded across N databases.
 
 **Indexes:**
 *   `(namespace, topic, status, priority, deliver_after)`: For high-speed prefetching.
-*   `(namespace, idempotency_key)`: For deduplication.
+*   `(namespace, idempotency_key)`: Unique constraint. Upserts are handled via `ON CONFLICT (id)` after resolving ID from redis/DB.
 
 ### 5.2. Redis Keys
 *   `mqueue:buffer:{namespace}:{topic}`: **List**. Temporary Write Buffer.
@@ -263,7 +263,7 @@ Sharded across N databases.
 *   **Constraint**: A single topic cannot exceed the write capacity of one PG node.
 
 ### 6.2. Failure Modes
-*   **Shard Down**: Writes to that shard fail immediately (500 Error). Reads stop. Data remains safe on disk.
+*   **Shard Down**: Writes to that shard fail immediately (500 Error). Reads stop for that shard. Data remains safe on disk. Circuit breakers prevent cascading failures.
 *   **Redis Down**: System degrades to "Slow Mode" (Direct DB writes/reads) OR fails if configured for reliability over availability. Current config fails writes if Redis is down (to protect WAL integrity).
 *   **Node Crash**:
     *   **In-Memory Buffer**: Lost from RAM.

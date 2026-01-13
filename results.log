@@ -1,0 +1,31 @@
+=== RUN   TestStoreIntegration
+=== RUN   TestStoreIntegration/PriorityOrdering
+{"level":"info","time":"2026-01-13T20:12:59.081+0100","caller":"flusher/flusher.go:103","msg":"Flushed items{count 11 3  <nil>}"}
+=== RUN   TestStoreIntegration/DelayedDelivery
+{"level":"info","time":"2026-01-13T20:13:02.071+0100","caller":"flusher/flusher.go:103","msg":"Flushed items{count 11 1  <nil>}"}
+=== RUN   TestStoreIntegration/LeaseTimeoutRedelivery
+{"level":"info","time":"2026-01-13T20:13:06.081+0100","caller":"flusher/flusher.go:103","msg":"Flushed items{count 11 1  <nil>}"}
+=== RUN   TestStoreIntegration/ConcurrentWorkers
+{"level":"info","time":"2026-01-13T20:13:13.074+0100","caller":"flusher/flusher.go:103","msg":"Flushed items{count 11 5  <nil>}"}
+{"level":"info","time":"2026-01-13T20:13:13.086+0100","caller":"flusher/flusher.go:103","msg":"Flushed items{count 11 5  <nil>}"}
+=== RUN   TestStoreIntegration/RedisReadyQueueServing
+{"level":"info","time":"2026-01-13T20:13:18.074+0100","caller":"flusher/flusher.go:103","msg":"Flushed items{count 11 2  <nil>}"}
+{"level":"info","time":"2026-01-13T20:13:18.080+0100","caller":"flusher/flusher.go:103","msg":"Flushed items{count 11 2  <nil>}"}
+=== RUN   TestStoreIntegration/IdempotencyKey
+{"level":"info","time":"2026-01-13T20:13:22.071+0100","caller":"flusher/flusher.go:103","msg":"Flushed items{count 11 1  <nil>}"}
+{"level":"info","time":"2026-01-13T20:13:27.071+0100","caller":"flusher/flusher.go:103","msg":"Flushed items{count 11 1  <nil>}"}
+=== RUN   TestStoreIntegration/WALRecovery
+{"level":"error","time":"2026-01-13T20:13:31.148+0100","caller":"prefetch/redis_prefetch.go:92","msg":"Failed to lease items{error 26 0  lease items: sql: database is closed}","stacktrace":"mqueue/internal/prefetch.(*RedisPrefetcher).prefetch.func1\n\t/home/morah-paul/Desktop/mqueue/internal/prefetch/redis_prefetch.go:92\nmqueue/internal/prefetch.(*RedisPrefetcher).prefetch\n\t/home/morah-paul/Desktop/mqueue/internal/prefetch/redis_prefetch.go:124"}
+{"level":"error","time":"2026-01-13T20:13:31.148+0100","caller":"prefetch/redis_prefetch.go:92","msg":"Failed to lease items{error 26 0  lease items: sql: database is closed}","stacktrace":"mqueue/internal/prefetch.(*RedisPrefetcher).prefetch.func1\n\t/home/morah-paul/Desktop/mqueue/internal/prefetch/redis_prefetch.go:92\nmqueue/internal/prefetch.(*RedisPrefetcher).prefetch\n\t/home/morah-paul/Desktop/mqueue/internal/prefetch/redis_prefetch.go:124"}
+{"level":"error","time":"2026-01-13T20:13:31.148+0100","caller":"prefetch/redis_prefetch.go:92","msg":"Failed to lease items{error 26 0  lease items: sql: database is closed}","stacktrace":"mqueue/internal/prefetch.(*RedisPrefetcher).prefetch.func1\n\t/home/morah-paul/Desktop/mqueue/internal/prefetch/redis_prefetch.go:92\nmqueue/internal/prefetch.(*RedisPrefetcher).prefetch\n\t/home/morah-paul/Desktop/mqueue/internal/prefetch/redis_prefetch.go:124"}
+{"level":"error","time":"2026-01-13T20:13:31.148+0100","caller":"prefetch/redis_prefetch.go:92","msg":"Failed to lease items{error 26 0  lease items: sql: database is closed}","stacktrace":"mqueue/internal/prefetch.(*RedisPrefetcher).prefetch.func1\n\t/home/morah-paul/Desktop/mqueue/internal/prefetch/redis_prefetch.go:92\nmqueue/internal/prefetch.(*RedisPrefetcher).prefetch\n\t/home/morah-paul/Desktop/mqueue/internal/prefetch/redis_prefetch.go:124"}
+--- PASS: TestStoreIntegration (38.27s)
+    --- PASS: TestStoreIntegration/PriorityOrdering (3.01s)
+    --- PASS: TestStoreIntegration/DelayedDelivery (4.01s)
+    --- PASS: TestStoreIntegration/LeaseTimeoutRedelivery (7.03s)
+    --- PASS: TestStoreIntegration/ConcurrentWorkers (3.01s)
+    --- PASS: TestStoreIntegration/RedisReadyQueueServing (4.00s)
+    --- PASS: TestStoreIntegration/IdempotencyKey (10.00s)
+    --- PASS: TestStoreIntegration/WALRecovery (0.09s)
+PASS
+ok  	mqueue/tests	38.319s

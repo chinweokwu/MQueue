@@ -156,7 +156,7 @@ func (p *RedisPrefetcher) merge(ctx context.Context) {
 				continue
 			}
 
-			if err := client.LPush(ctx, fmt.Sprintf("mqueue:queue:%s:%s", item.Namespace, item.Topic), data).Err(); err != nil {
+			if err := client.RPush(ctx, fmt.Sprintf("mqueue:queue:%s:%s", item.Namespace, item.Topic), data).Err(); err != nil {
 				p.logger.Error("Failed to push to queue", zap.Error(err))
 				continue
 			}

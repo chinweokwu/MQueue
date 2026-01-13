@@ -1,0 +1,62 @@
+=== RUN   TestE2E_HTTP_Flow
+=== RUN   TestE2E_HTTP_Flow/HealthCheck
+=== RUN   TestE2E_HTTP_Flow/AuthMiddleware
+{"level":"error","time":"2026-01-13T20:03:37.787+0100","caller":"server/router.go:279","msg":"Missing authorization token","stacktrace":"mqueue/internal/server.SetupRouter.func2.authMiddleware.8.1\n\t/home/morah-paul/Desktop/mqueue/internal/server/router.go:279\nnet/http.HandlerFunc.ServeHTTP\n\t/home/morah-paul/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.9.linux-amd64/src/net/http/server.go:2294\ngithub.com/go-chi/chi/v5.(*ChainHandler).ServeHTTP\n\t/home/morah-paul/go/pkg/mod/github.com/go-chi/chi/v5@v5.0.7/chain.go:31\ngithub.com/go-chi/chi/v5.(*Mux).routeHTTP\n\t/home/morah-paul/go/pkg/mod/github.com/go-chi/chi/v5@v5.0.7/mux.go:442\nnet/http.HandlerFunc.ServeHTTP\n\t/home/morah-paul/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.9.linux-amd64/src/net/http/server.go:2294\ngithub.com/go-chi/httprate.(*RateLimiter).Handler-fm.(*RateLimiter).Handler.func1\n\t/home/morah-paul/go/pkg/mod/github.com/go-chi/httprate@v0.15.0/limiter.go:148\nnet/http.HandlerFunc.ServeHTTP\n\t/home/morah-paul/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.9.linux-amd64/src/net/http/server.go:2294\ngithub.com/go-chi/chi/v5.(*Mux).ServeHTTP\n\t/home/morah-paul/go/pkg/mod/github.com/go-chi/chi/v5@v5.0.7/mux.go:88\nnet/http.serverHandler.ServeHTTP\n\t/home/morah-paul/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.9.linux-amd64/src/net/http/server.go:3301\nnet/http.(*conn).serve\n\t/home/morah-paul/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.9.linux-amd64/src/net/http/server.go:2102"}
+{"level":"error","time":"2026-01-13T20:03:37.789+0100","caller":"server/router.go:293","msg":"Invalid JWT token{error 26 0  token contains an invalid number of segments}","stacktrace":"mqueue/internal/server.SetupRouter.func2.authMiddleware.8.1\n\t/home/morah-paul/Desktop/mqueue/internal/server/router.go:293\nnet/http.HandlerFunc.ServeHTTP\n\t/home/morah-paul/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.9.linux-amd64/src/net/http/server.go:2294\ngithub.com/go-chi/chi/v5.(*ChainHandler).ServeHTTP\n\t/home/morah-paul/go/pkg/mod/github.com/go-chi/chi/v5@v5.0.7/chain.go:31\ngithub.com/go-chi/chi/v5.(*Mux).routeHTTP\n\t/home/morah-paul/go/pkg/mod/github.com/go-chi/chi/v5@v5.0.7/mux.go:442\nnet/http.HandlerFunc.ServeHTTP\n\t/home/morah-paul/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.9.linux-amd64/src/net/http/server.go:2294\ngithub.com/go-chi/httprate.(*RateLimiter).Handler-fm.(*RateLimiter).Handler.func1\n\t/home/morah-paul/go/pkg/mod/github.com/go-chi/httprate@v0.15.0/limiter.go:148\nnet/http.HandlerFunc.ServeHTTP\n\t/home/morah-paul/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.9.linux-amd64/src/net/http/server.go:2294\ngithub.com/go-chi/chi/v5.(*Mux).ServeHTTP\n\t/home/morah-paul/go/pkg/mod/github.com/go-chi/chi/v5@v5.0.7/mux.go:88\nnet/http.serverHandler.ServeHTTP\n\t/home/morah-paul/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.9.linux-amd64/src/net/http/server.go:3301\nnet/http.(*conn).serve\n\t/home/morah-paul/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.9.linux-amd64/src/net/http/server.go:2102"}
+=== RUN   TestE2E_HTTP_Flow/EnqueueAndDequeue
+{"level":"info","time":"2026-01-13T20:03:37.792+0100","caller":"server/router.go:112","msg":"Enqueued items{count 11 1  <nil>} {duration 8 1202046  <nil>}"}
+{"level":"info","time":"2026-01-13T20:03:37.905+0100","caller":"flusher/flusher.go:103","msg":"Flushed items{count 11 1  <nil>}"}
+{"level":"info","time":"2026-01-13T20:03:42.796+0100","caller":"server/router.go:174","msg":"Dequeued items{count 11 1  <nil>} {duration 8 1328456  <nil>}"}
+{"level":"info","time":"2026-01-13T20:03:42.811+0100","caller":"server/router.go:195","msg":"Acknowledged item{id 11 269541988011868160  <nil>} {duration 8 13871005  <nil>}"}
+=== RUN   TestE2E_HTTP_Flow/DLQ_Flow
+{"level":"info","time":"2026-01-13T20:03:42.814+0100","caller":"server/router.go:112","msg":"Enqueued items{count 11 1  <nil>} {duration 8 831256  <nil>}"}
+{"level":"info","time":"2026-01-13T20:03:42.896+0100","caller":"flusher/flusher.go:103","msg":"Flushed items{count 11 1  <nil>}"}
+{"level":"info","time":"2026-01-13T20:03:43.818+0100","caller":"server/router.go:174","msg":"Dequeued items{count 11 1  <nil>} {duration 8 1170971  <nil>}"}
+{"level":"info","time":"2026-01-13T20:03:43.835+0100","caller":"retry/retry_manager.go:69","msg":"Retried item{id 11 269542009079857152  <nil>} {retries 11 1  <nil>} {backoff 8 0  <nil>}"}
+{"level":"info","time":"2026-01-13T20:03:43.835+0100","caller":"server/router.go:224","msg":"Negatively acknowledged item{id 11 269542009079857152  <nil>} {duration 8 14423736  <nil>}"}
+{"level":"info","time":"2026-01-13T20:03:43.840+0100","caller":"server/router.go:174","msg":"Dequeued items{count 11 0  <nil>} {duration 8 3046134  <nil>}"}
+    e2e_test.go:357: expected item to nack, got none
+{"level":"info","time":"2026-01-13T20:03:43.841+0100","caller":"flusher/flusher.go:50","msg":"Flusher shutting down, performing final flush..."}
+{"level":"info","time":"2026-01-13T20:03:43.841+0100","caller":"prefetch/redis_prefetch.go:50","msg":"Prefetcher shutting down"}
+--- FAIL: TestE2E_HTTP_Flow (11.15s)
+    --- PASS: TestE2E_HTTP_Flow/HealthCheck (0.01s)
+    --- PASS: TestE2E_HTTP_Flow/AuthMiddleware (0.00s)
+    --- PASS: TestE2E_HTTP_Flow/EnqueueAndDequeue (5.02s)
+    --- FAIL: TestE2E_HTTP_Flow/DLQ_Flow (1.03s)
+=== RUN   TestStoreIntegration
+{"level":"error","time":"2026-01-13T20:03:43.846+0100","caller":"buffer/buffer.go:171","msg":"Failed to get items from Redis list{error 26 0  redis: client is closed}","stacktrace":"mqueue/internal/buffer.(*RedisBuffer).GetItems\n\t/home/morah-paul/Desktop/mqueue/internal/buffer/buffer.go:171\nmqueue/internal/flusher.(*Flusher).flush\n\t/home/morah-paul/Desktop/mqueue/internal/flusher/flusher.go:76\nmqueue/internal/flusher.(*Flusher).flushAll\n\t/home/morah-paul/Desktop/mqueue/internal/flusher/flusher.go:68\nmqueue/internal/flusher.(*Flusher).Run\n\t/home/morah-paul/Desktop/mqueue/internal/flusher/flusher.go:51"}
+{"level":"error","time":"2026-01-13T20:03:43.846+0100","caller":"flusher/flusher.go:78","msg":"Failed to get items from buffer{error 26 0  get items from redis list: redis: client is closed}","stacktrace":"mqueue/internal/flusher.(*Flusher).flush\n\t/home/morah-paul/Desktop/mqueue/internal/flusher/flusher.go:78\nmqueue/internal/flusher.(*Flusher).flushAll\n\t/home/morah-paul/Desktop/mqueue/internal/flusher/flusher.go:68\nmqueue/internal/flusher.(*Flusher).Run\n\t/home/morah-paul/Desktop/mqueue/internal/flusher/flusher.go:51"}
+{"level":"error","time":"2026-01-13T20:03:43.846+0100","caller":"flusher/flusher.go:69","msg":"Flush failed{error 26 0  get items from buffer: get items from redis list: redis: client is closed} {namespace 15 0 e2e <nil>} {topic 15 0 dlq-topic <nil>}","stacktrace":"mqueue/internal/flusher.(*Flusher).flushAll\n\t/home/morah-paul/Desktop/mqueue/internal/flusher/flusher.go:69\nmqueue/internal/flusher.(*Flusher).Run\n\t/home/morah-paul/Desktop/mqueue/internal/flusher/flusher.go:51"}
+{"level":"info","time":"2026-01-13T20:03:43.846+0100","caller":"flusher/flusher.go:52","msg":"Flusher shutdown complete"}
+=== RUN   TestStoreIntegration/PriorityOrdering
+{"level":"info","time":"2026-01-13T20:03:49.917+0100","caller":"flusher/flusher.go:103","msg":"Flushed items{count 11 3  <nil>}"}
+=== RUN   TestStoreIntegration/DelayedDelivery
+{"level":"info","time":"2026-01-13T20:03:52.912+0100","caller":"flusher/flusher.go:103","msg":"Flushed items{count 11 1  <nil>}"}
+=== RUN   TestStoreIntegration/LeaseTimeoutRedelivery
+{"level":"info","time":"2026-01-13T20:03:56.909+0100","caller":"flusher/flusher.go:103","msg":"Flushed items{count 11 1  <nil>}"}
+=== RUN   TestStoreIntegration/ConcurrentWorkers
+{"level":"info","time":"2026-01-13T20:04:03.919+0100","caller":"flusher/flusher.go:103","msg":"Flushed items{count 11 5  <nil>}"}
+{"level":"info","time":"2026-01-13T20:04:03.923+0100","caller":"flusher/flusher.go:103","msg":"Flushed items{count 11 5  <nil>}"}
+=== RUN   TestStoreIntegration/RedisReadyQueueServing
+{"level":"info","time":"2026-01-13T20:04:08.916+0100","caller":"flusher/flusher.go:103","msg":"Flushed items{count 11 2  <nil>}"}
+{"level":"info","time":"2026-01-13T20:04:08.919+0100","caller":"flusher/flusher.go:103","msg":"Flushed items{count 11 2  <nil>}"}
+=== RUN   TestStoreIntegration/IdempotencyKey
+{"level":"info","time":"2026-01-13T20:04:12.920+0100","caller":"flusher/flusher.go:103","msg":"Flushed items{count 11 1  <nil>}"}
+{"level":"info","time":"2026-01-13T20:04:12.925+0100","caller":"flusher/flusher.go:103","msg":"Flushed items{count 11 1  <nil>}"}
+{"level":"info","time":"2026-01-13T20:04:17.912+0100","caller":"flusher/flusher.go:103","msg":"Flushed items{count 11 1  <nil>}"}
+{"level":"info","time":"2026-01-13T20:04:17.923+0100","caller":"flusher/flusher.go:103","msg":"Flushed items{count 11 1  <nil>}"}
+=== RUN   TestStoreIntegration/WALRecovery
+{"level":"error","time":"2026-01-13T20:04:21.982+0100","caller":"prefetch/redis_prefetch.go:92","msg":"Failed to lease items{error 26 0  lease items: sql: database is closed}","stacktrace":"mqueue/internal/prefetch.(*RedisPrefetcher).prefetch.func1\n\t/home/morah-paul/Desktop/mqueue/internal/prefetch/redis_prefetch.go:92\nmqueue/internal/prefetch.(*RedisPrefetcher).prefetch\n\t/home/morah-paul/Desktop/mqueue/internal/prefetch/redis_prefetch.go:124"}
+{"level":"error","time":"2026-01-13T20:04:21.982+0100","caller":"prefetch/redis_prefetch.go:92","msg":"Failed to lease items{error 26 0  lease items: sql: database is closed}","stacktrace":"mqueue/internal/prefetch.(*RedisPrefetcher).prefetch.func1\n\t/home/morah-paul/Desktop/mqueue/internal/prefetch/redis_prefetch.go:92\nmqueue/internal/prefetch.(*RedisPrefetcher).prefetch\n\t/home/morah-paul/Desktop/mqueue/internal/prefetch/redis_prefetch.go:124"}
+{"level":"error","time":"2026-01-13T20:04:21.982+0100","caller":"prefetch/redis_prefetch.go:92","msg":"Failed to lease items{error 26 0  lease items: sql: database is closed}","stacktrace":"mqueue/internal/prefetch.(*RedisPrefetcher).prefetch.func1\n\t/home/morah-paul/Desktop/mqueue/internal/prefetch/redis_prefetch.go:92\nmqueue/internal/prefetch.(*RedisPrefetcher).prefetch\n\t/home/morah-paul/Desktop/mqueue/internal/prefetch/redis_prefetch.go:124"}
+--- PASS: TestStoreIntegration (38.25s)
+    --- PASS: TestStoreIntegration/PriorityOrdering (3.02s)
+    --- PASS: TestStoreIntegration/DelayedDelivery (4.02s)
+    --- PASS: TestStoreIntegration/LeaseTimeoutRedelivery (7.02s)
+    --- PASS: TestStoreIntegration/ConcurrentWorkers (3.01s)
+    --- PASS: TestStoreIntegration/RedisReadyQueueServing (4.00s)
+    --- PASS: TestStoreIntegration/IdempotencyKey (10.00s)
+    --- PASS: TestStoreIntegration/WALRecovery (0.11s)
+FAIL
+FAIL	mqueue/tests	49.458s
+FAIL

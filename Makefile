@@ -1,4 +1,7 @@
-.PHONY: all build run test integration-test setup-wal clean docker-build docker-run
+docker-test:
+	docker-compose -f docker-compose.test.yml up --build --abort-on-container-exit --exit-code-from test-runner
+
+.PHONY: build test integration-test clean run docker-test setup-wal clean docker-build docker-run
 
 all: build
 

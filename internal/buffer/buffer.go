@@ -58,56 +58,71 @@ func (b *RedisBuffer) Enqueue(ctx context.Context, items []store.Item, wals *wal
 		client := b.store.GetRedisForShard(key.namespace, key.topic)
 		listKey := fmt.Sprintf("mqueue:buffer:%s:%s", key.namespace, key.topic)
 
+		// 1. Resolve existing IDs for idempotent items
+		var idKeys []string
+		var idempIndices []int
+		seenInBatch := make(map[string]int64)
+
+		for i, item := range shardItems {
+			if item.IdempotencyKey != nil {
+				idKey := fmt.Sprintf("mqueue:dedup:%s:%s:%s", key.namespace, key.topic, *item.IdempotencyKey)
+				idKeys = append(idKeys, idKey)
+				idempIndices = append(idempIndices, i)
+			}
+		}
+
+		existingIDs := make(map[string]int64)
+		if len(idKeys) > 0 {
+			results, err := client.MGet(ctx, idKeys...).Result()
+			if err != nil {
+				b.logger.Error("Failed to check dedup keys in Redis", zap.Error(err))
+				return nil, err
+			}
+			for i, result := range results {
+				if result != nil {
+					if idStr, ok := result.(string); ok {
+						// Assuming simple integer stored as string
+						var idVal int64
+						if _, err := fmt.Sscanf(idStr, "%d", &idVal); err == nil {
+							idx := idempIndices[i]
+							k := *shardItems[idx].IdempotencyKey
+							existingIDs[k] = idVal
+						}
+					}
+				}
+			}
+		}
+
 		pipe := client.Pipeline()
-
-		// In-memory deduplication for items in the same request batch
-		seenInBatch := make(map[string]bool)
-
 		var ids []int64
 
 		for i := range shardItems {
 			// Pointer to item allows modification
 			item := &shardItems[i]
 
-			// Generate ID immediately (Async Enqueue Magic)
-			item.ID = b.node.Generate()
+			if item.IdempotencyKey == nil {
+				// Non-idempotent: New ID
+				item.ID = b.node.Generate()
+			} else {
+				k := *item.IdempotencyKey
+				if id, ok := seenInBatch[k]; ok {
+					item.ID = id
+				} else if id, ok := existingIDs[k]; ok {
+					item.ID = id
+					seenInBatch[k] = id
+				} else {
+					item.ID = b.node.Generate()
+					seenInBatch[k] = item.ID
+				}
+				
+				// Update Redis Deduplication Key
+				dedupKey := fmt.Sprintf("mqueue:dedup:%s:%s:%s", key.namespace, key.topic, k)
+				pipe.Set(ctx, dedupKey, fmt.Sprintf("%d", item.ID), b.cfg.BufferTTL)
+			}
+			
 			ids = append(ids, item.ID)
 
-			// Non-idempotent items: enqueue
-			if item.IdempotencyKey == nil {
-				data, err := json.Marshal(item)
-				if err != nil {
-					return nil, fmt.Errorf("marshal non-idempotent item: %w", err)
-				}
-				pipe.LPush(ctx, listKey, data)
-				continue
-			}
-
-			idempKey := *item.IdempotencyKey
-
-			// 1. Skip if already seen in this batch
-			if seenInBatch[idempKey] {
-				b.logger.Info("Skipping in-batch duplicate", zap.String("idempotency_key", idempKey))
-				continue
-			}
-			seenInBatch[idempKey] = true
-
-			// 2. Check Redis for cross-request deduplication
-			dedupKey := fmt.Sprintf("mqueue:dedup:%s:%s:%s", key.namespace, key.topic, idempKey)
-			exists, err := client.Exists(ctx, dedupKey).Result()
-			if err != nil {
-				b.logger.Error("Failed to check dedup key in Redis", zap.Error(err))
-				return nil, err
-			}
-			if exists > 0 {
-				b.logger.Info("Skipping cross-request duplicate", zap.String("idempotency_key", idempKey))
-				continue
-			}
-
-			// Mark as seen in Redis with TTL
-			pipe.Set(ctx, dedupKey, "1", b.cfg.BufferTTL)
-
-			// Enqueue the item
+			// Enqueue the item (Always enqueue to allow Upsert logic in Store)
 			data, err := json.Marshal(item)
 			if err != nil {
 				return nil, fmt.Errorf("marshal item: %w", err)
@@ -117,6 +132,10 @@ func (b *RedisBuffer) Enqueue(ctx context.Context, items []store.Item, wals *wal
 
 		// Ensure list TTL
 		pipe.Expire(ctx, listKey, b.cfg.BufferTTL)
+		
+		// Track active topic
+		topicSetKey := fmt.Sprintf("mqueue:active_topics:%s", key.namespace)
+		pipe.SAdd(ctx, topicSetKey, key.topic)
 
 		if _, err := pipe.Exec(ctx); err != nil {
 			b.logger.Error("Failed to enqueue to Redis buffer", zap.Error(err))

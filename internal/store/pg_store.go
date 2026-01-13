@@ -12,6 +12,7 @@ import (
 	"mqueue/internal/config"
 	"mqueue/internal/log"
 	"mqueue/internal/wal"
+	"sort"
 
 	_ "github.com/lib/pq"
 	"github.com/redis/go-redis/v9"
@@ -142,11 +143,15 @@ func (s *PGStore) UpsertItems(ctx context.Context, items []Item) ([]int64, error
 	var ids []int64
 	for _, item := range items {
 		var rawID int64
+		metaBytes, err := json.Marshal(item.Metadata)
+		if err != nil {
+			return nil, fmt.Errorf("marshal metadata: %w", err)
+		}
 		// Insert with explicit ID
-		err := tx.QueryRowContext(ctx, `
+		err = tx.QueryRowContext(ctx, `
                INSERT INTO items (id, namespace, topic, idempotency_key, priority, payload, metadata, deliver_after, status, retries, created_at, updated_at)
                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-               ON CONFLICT (namespace, idempotency_key) DO UPDATE
+               ON CONFLICT (id) DO UPDATE
                SET priority = EXCLUDED.priority,
                    payload = EXCLUDED.payload,
                    metadata = EXCLUDED.metadata,
@@ -154,7 +159,7 @@ func (s *PGStore) UpsertItems(ctx context.Context, items []Item) ([]int64, error
                    status = EXCLUDED.status,
                    updated_at = EXCLUDED.updated_at
                RETURNING id
-           `, item.ID, item.Namespace, item.Topic, item.IdempotencyKey, item.Priority, item.Payload, item.Metadata,
+           `, item.ID, item.Namespace, item.Topic, item.IdempotencyKey, item.Priority, item.Payload, metaBytes,
 			item.DeliverAfter, item.Status, item.Retries, item.CreatedAt, item.UpdatedAt).Scan(&rawID)
 		if err != nil {
 			return nil, fmt.Errorf("upsert item: %w", err)
@@ -215,15 +220,32 @@ func (s *PGStore) LeaseItems(ctx context.Context, namespace, topic, leaseOwner s
 	var items []Item
 	for rows.Next() {
 		var item Item
-		err := rows.Scan(&item.ID, &item.Namespace, &item.Topic, &item.IdempotencyKey, &item.Priority, &item.Payload, &item.Metadata,
+		var metaBytes []byte
+		err := rows.Scan(&item.ID, &item.Namespace, &item.Topic, &item.IdempotencyKey, &item.Priority, &item.Payload, &metaBytes,
 			&item.DeliverAfter, &item.LeaseExpiresAt, &item.LeaseOwner, &item.TTL, &item.Status, &item.Retries, &item.CreatedAt,
 			&item.UpdatedAt, &item.FirstFailedAt)
 		if err != nil {
 			return nil, fmt.Errorf("scan item: %w", err)
 		}
+		if len(metaBytes) > 0 {
+			if err := json.Unmarshal(metaBytes, &item.Metadata); err != nil {
+				return nil, fmt.Errorf("unmarshal metadata: %w", err)
+			}
+		}
 		// IDs are global, no encoding
 		items = append(items, item)
 	}
+	// Sort items by priority (ASC) then deliver_after (ASC) as RETURNING order is not guaranteed
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].Priority != items[j].Priority {
+			// Lower priority value = Higher priority (usually)
+			// But check expectation: 1 is High, 10 is Low.
+			// Postgres ORDER BY priority ASC -> 1 first.
+			return items[i].Priority < items[j].Priority
+		}
+		return items[i].DeliverAfter.Before(items[j].DeliverAfter)
+	})
+
 	return items, nil
 }
 
@@ -250,10 +272,14 @@ func (s *PGStore) GetItem(ctx context.Context, namespace, topic string, itemID i
 		return Item{}, fmt.Errorf("get db: %w", err)
 	}
 	var item Item
+	var metaBytes []byte
 	err = db.QueryRowContext(ctx, `
            SELECT id, namespace, topic, idempotency_key, priority, payload, metadata, deliver_after, lease_expires_at, lease_owner, ttl, status, retries, created_at, updated_at, first_failed_at
            FROM items WHERE id = $1
-       `, itemID).Scan(&item.ID, &item.Namespace, &item.Topic, &item.IdempotencyKey, &item.Priority, &item.Payload, &item.Metadata, &item.DeliverAfter, &item.LeaseExpiresAt, &item.LeaseOwner, &item.TTL, &item.Status, &item.Retries, &item.CreatedAt, &item.UpdatedAt, &item.FirstFailedAt)
+       `, itemID).Scan(&item.ID, &item.Namespace, &item.Topic, &item.IdempotencyKey, &item.Priority, &item.Payload, &metaBytes, &item.DeliverAfter, &item.LeaseExpiresAt, &item.LeaseOwner, &item.TTL, &item.Status, &item.Retries, &item.CreatedAt, &item.UpdatedAt, &item.FirstFailedAt)
+	if err == nil && len(metaBytes) > 0 {
+		_ = json.Unmarshal(metaBytes, &item.Metadata)
+	}
 	if err != nil {
 		return Item{}, fmt.Errorf("get item: %w", err)
 	}
@@ -272,10 +298,11 @@ func (s *PGStore) MoveToDLQ(ctx context.Context, item Item, lastError string) er
 	}
 	defer tx.Rollback()
 
+	metaBytes, _ := json.Marshal(item.Metadata)
 	_, err = tx.ExecContext(ctx, `
            INSERT INTO dead_letter (original_id, namespace, topic, idempotency_key, priority, payload, metadata, last_error, retries, first_failed_at, moved_at)
            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-       `, item.ID, item.Namespace, item.Topic, item.IdempotencyKey, item.Priority, item.Payload, item.Metadata, lastError, item.Retries, item.FirstFailedAt, time.Now())
+       `, item.ID, item.Namespace, item.Topic, item.IdempotencyKey, item.Priority, item.Payload, metaBytes, lastError, item.Retries, item.FirstFailedAt, time.Now())
 	if err != nil {
 		return fmt.Errorf("insert into DLQ: %w", err)
 	}
@@ -314,6 +341,20 @@ func (s *PGStore) GetActiveTopics(ctx context.Context, namespace string) ([]stri
 			if !seen[topic] {
 				topics = append(topics, topic)
 				seen[topic] = true
+			}
+		}
+	}
+	
+	// Also check Redis for buffered topics
+	for _, client := range s.redis {
+		topicSetKey := fmt.Sprintf("mqueue:active_topics:%s", namespace)
+		redisTopics, err := client.SMembers(ctx, topicSetKey).Result()
+		if err == nil {
+			for _, topic := range redisTopics {
+				if !seen[topic] {
+					topics = append(topics, topic)
+					seen[topic] = true
+				}
 			}
 		}
 	}

@@ -68,6 +68,7 @@ Configuration is loaded from `.env` or environment variables.
 | `LOG_ENCODING` | `json` (prod), `console` (dev) | `json` |
 | `JWT_SECRET` | Secret for verifying auth tokens | **Required** |
 | `NAMESPACE_QUOTAS`| Rate limits (e.g. `tenant-a:1000,tenant-b:500`) | `""` |
+| `BUFFER_TTL` | Time to keep items in Redis Buffer (e.g. `1m`, `1h`) | `1m` |
 
 ---
 
@@ -78,7 +79,13 @@ Configuration is loaded from `.env` or environment variables.
 docker-compose up --build -d
 ```
 
-### 2. Verify Health
+### 2. Run Integration Tests (Dockerized)
+Run the full integration suite in a clean, isolated environment:
+```bash
+make docker-test
+```
+
+### 3. Verify Health
 ```bash
 curl -k https://localhost:8080/health
 # Output: OK

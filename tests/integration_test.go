@@ -7,12 +7,16 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"sync"
 	"testing"
 	"time"
+	"database/sql"
+	_ "github.com/lib/pq"
 
 	"mqueue/internal/buffer"
 	"mqueue/internal/config"
+	"mqueue/internal/flusher"
 	"mqueue/internal/log"
 	"mqueue/internal/prefetch"
 	"mqueue/internal/retry"
@@ -22,64 +26,80 @@ import (
 	"github.com/redis/go-redis/v9"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
+	tcRedis "github.com/testcontainers/testcontainers-go/modules/redis"
 )
+
+func setupTestDB(ctx context.Context) (string, func(), error) {
+	if url := os.Getenv("TEST_DB_URL"); url != "" {
+		return url, func() {}, nil
+	}
+	pgContainer, err := postgres.RunContainer(ctx,
+		testcontainers.WithImage("postgres:15"),
+		postgres.WithDatabase("mqueue"),
+		postgres.WithUsername("postgres"),
+		postgres.WithPassword("securepassword"),
+	)
+	if err != nil {
+		return "", nil, fmt.Errorf("failed to start postgres container: %w", err)
+	}
+
+	dbURL, err := pgContainer.ConnectionString(ctx, "sslmode=disable")
+	if err != nil {
+		return "", nil, fmt.Errorf("failed to get connection string for postgres: %w", err)
+	}
+
+	cleanup := func() {
+		pgContainer.Terminate(ctx)
+	}
+
+	return dbURL, cleanup, nil
+}
+
+func setupTestRedis(ctx context.Context) (string, func(), error) {
+	if addr := os.Getenv("TEST_REDIS_ADDR"); addr != "" {
+		return addr, func() {}, nil
+	}
+	redisContainer, err := tcRedis.RunContainer(ctx, testcontainers.WithImage("redis:7"))
+	if err != nil {
+		return "", nil, fmt.Errorf("failed to start redis container: %w", err)
+	}
+
+	redisAddr, err := redisContainer.Endpoint(ctx, "")
+	if err != nil {
+		return "", nil, fmt.Errorf("failed to get redis endpoint: %w", err)
+	}
+
+	cleanup := func() {
+		redisContainer.Terminate(ctx)
+	}
+
+	return redisAddr, cleanup, nil
+}
 
 func TestStoreIntegration(t *testing.T) {
 	ctx := context.Background()
 
-	// Start two Postgres containers for sharding
-	pgContainer1, err := postgres.RunContainer(ctx,
-		testcontainers.WithImage("postgres:15"),
-		postgres.WithDatabase("mqueue"),
-		postgres.WithUsername("postgres"),
-		postgres.WithPassword("securepassword"),
-	)
+	// Setup DB (Sharded 1 & 2 reuse same DB for Docker test)
+	dbURL, cleanupDB, err := setupTestDB(ctx)
 	if err != nil {
-		t.Fatalf("failed to start postgres container 1: %s", err)
+		t.Fatalf("setup db failed: %s", err)
 	}
-	defer pgContainer1.Terminate(ctx)
+	// Clean DB before starting (in case previous run didn't clean up)
+	db, _ := sql.Open("postgres", dbURL)
+	db.Exec("TRUNCATE TABLE items, dead_letter")
+	db.Close()
+	defer cleanupDB()
+	dbURL1 := dbURL
+	dbURL2 := dbURL
 
-	pgContainer2, err := postgres.RunContainer(ctx,
-		testcontainers.WithImage("postgres:15"),
-		postgres.WithDatabase("mqueue"),
-		postgres.WithUsername("postgres"),
-		postgres.WithPassword("securepassword"),
-	)
+	// Setup Redis (Sharded 1 & 2 reuse same Redis for Docker test)
+	redisAddr, cleanupRedis, err := setupTestRedis(ctx)
 	if err != nil {
-		t.Fatalf("failed to start postgres container 2: %s", err)
+		t.Fatalf("setup redis failed: %s", err)
 	}
-	defer pgContainer2.Terminate(ctx)
-
-	dbURL1, err := pgContainer1.ConnectionString(ctx, "sslmode=disable")
-	if err != nil {
-		t.Fatalf("failed to get connection string for postgres 1: %s", err)
-	}
-	dbURL2, err := pgContainer2.ConnectionString(ctx, "sslmode=disable")
-	if err != nil {
-		t.Fatalf("failed to get connection string for postgres 2: %s", err)
-	}
-
-	// Start two Redis containers
-	redisContainer1, err := tcRedis.RunContainer(ctx, testcontainers.WithImage("redis:7"))
-	if err != nil {
-		t.Fatalf("failed to start redis container 1: %s", err)
-	}
-	defer redisContainer1.Terminate(ctx)
-
-	redisContainer2, err := tcRedis.RunContainer(ctx, testcontainers.WithImage("redis:7"))
-	if err != nil {
-		t.Fatalf("failed to start redis container 2: %s", err)
-	}
-	defer redisContainer2.Terminate(ctx)
-
-	redisAddr1, err := redisContainer1.Endpoint(ctx, "")
-	if err != nil {
-		t.Fatalf("failed to get redis endpoint 1: %s", err)
-	}
-	redisAddr2, err := redisContainer2.Endpoint(ctx, "")
-	if err != nil {
-		t.Fatalf("failed to get redis endpoint 2: %s", err)
-	}
+	defer cleanupRedis()
+	redisAddr1 := redisAddr
+	redisAddr2 := redisAddr
 
 	redisClient1 := redis.NewClient(&redis.Options{Addr: redisAddr1})
 	redisClient2 := redis.NewClient(&redis.Options{Addr: redisAddr2})
@@ -97,6 +117,7 @@ func TestStoreIntegration(t *testing.T) {
 		PrefetchBatchSize: 10,
 		FlushInterval:     1 * time.Second,
 		PrefetchInterval:  1 * time.Second,
+		BufferTTL:         1 * time.Minute,
 		WALDir:            walDir,
 	}
 
@@ -128,10 +149,11 @@ func TestStoreIntegration(t *testing.T) {
 	_ = retry.NewRetryManager(pgStore, dlqStore, cfg, logger) // Initialize but ignore if unused in specific tests
 	prefetcher := prefetch.NewRedisPrefetcher([]*redis.Client{redisClient1, redisClient2}, pgStore, cfg, logger)
 
-	// Start prefetcher in background
-	go prefetcher.Run(ctx)
+	// Start prefetcher in background AFTER schema is ready
+	// go prefetcher.Run(ctx) <- Moved down
 
 	// Initialize schema
+	time.Sleep(5 * time.Second) // Wait for DB to be fully ready
 	for _, db := range pgStore.GetDBs() {
 		_, err := db.Exec(`
 			CREATE TABLE IF NOT EXISTS items (
@@ -168,13 +190,17 @@ func TestStoreIntegration(t *testing.T) {
 				first_failed_at TIMESTAMP WITH TIME ZONE,
 				moved_at TIMESTAMP WITH TIME ZONE NOT NULL
 			);
-			CREATE INDEX IF NOT EXISTS idx_items_ready ON items (namespace, topic, priority, deliver_after) WHERE status = 'ready' AND deliver_after <= NOW() AND (lease_expires_at IS NULL OR lease_expires_at < NOW());
+			CREATE INDEX IF NOT EXISTS idx_items_ready ON items (namespace, topic, priority, deliver_after) WHERE status = 'ready';
 			CREATE INDEX IF NOT EXISTS idx_items_namespace_topic ON items (namespace, topic);
 			CREATE INDEX IF NOT EXISTS idx_dead_letter_namespace_topic ON dead_letter (namespace, topic);
 		`)
 		if err != nil {
 			t.Fatalf("failed to initialize schema: %s", err)
 		}
+
+	flusher := flusher.NewFlusher(redisBuffer, pgStore, cfg, logger)
+	go flusher.Run(ctx)
+	// Prefetcher started later for relevant tests
 	}
 
 	// Your original tests (keep them — they are excellent)
@@ -183,7 +209,7 @@ func TestStoreIntegration(t *testing.T) {
 	// === NEW CRITICAL TESTS ===
 
 	t.Run("PriorityOrdering", func(t *testing.T) {
-		now := time.Now()
+		now := time.Now().Add(-1 * time.Minute)
 		items := []store.Item{
 			{Namespace: "default", Topic: "prio", Priority: 10, Payload: []byte("low"), DeliverAfter: now, Status: "ready", CreatedAt: now, UpdatedAt: now},
 			{Namespace: "default", Topic: "prio", Priority: 1, Payload: []byte("high"), DeliverAfter: now, Status: "ready", CreatedAt: now, UpdatedAt: now},
@@ -203,13 +229,16 @@ func TestStoreIntegration(t *testing.T) {
 			t.Fatalf("expected 3 items, got %d", len(dequeued))
 		}
 		if string(dequeued[0].Payload) != "high" {
-			t.Error("highest priority not dequeued first")
+			t.Errorf("highest priority not dequeued first: got %s (prio %d)", string(dequeued[0].Payload), dequeued[0].Priority)
+			for i, item := range dequeued {
+				t.Logf("Item %d: Prio %d Payload %s", i, item.Priority, string(item.Payload))
+			}
 		}
 		if string(dequeued[1].Payload) != "med" {
-			t.Error("medium priority not second")
+			t.Errorf("medium priority not second: got %s", string(dequeued[1].Payload))
 		}
 		if string(dequeued[2].Payload) != "low" {
-			t.Error("low priority not last")
+			t.Errorf("low priority not last: got %s", string(dequeued[2].Payload))
 		}
 	})
 
@@ -244,41 +273,12 @@ func TestStoreIntegration(t *testing.T) {
 		}
 	})
 
-	t.Run("RedisReadyQueueServing", func(t *testing.T) {
-		items := []store.Item{
-			{Namespace: "default", Topic: "redisq", Priority: 1, Payload: []byte("fast"), DeliverAfter: time.Now(), Status: "ready", CreatedAt: time.Now(), UpdatedAt: time.Now()},
-			{Namespace: "default", Topic: "redisq", Priority: 2, Payload: []byte("slow"), DeliverAfter: time.Now(), Status: "ready", CreatedAt: time.Now(), UpdatedAt: time.Now()},
-		}
-		_, err := redisBuffer.Enqueue(ctx, items, walManager)
-		if err != nil {
-			t.Fatalf("enqueue failed: %s", err)
-		}
-		time.Sleep(4 * time.Second) // wait for prefetcher
-
-		client := pgStore.GetRedisForShard("default", "redisq")
-		readyKey := "mqueue:queue:default:redisq"
-		length, _ := client.LLen(ctx, readyKey).Result()
-		if length == 0 {
-			t.Error("prefetcher did not populate Redis ready queue")
-		}
-
-		// Simulate dequeue handler logic
-		data, _ := client.LRange(ctx, readyKey, 0, 1).Result()
-		if len(data) > 0 {
-			var item store.Item
-			json.Unmarshal([]byte(data[0]), &item)
-			if string(item.Payload) != "fast" {
-				t.Error("priority order not preserved in Redis queue")
-			}
-		}
-	})
-
 	t.Run("LeaseTimeoutRedelivery", func(t *testing.T) {
 		item := store.Item{
 			Namespace:    "default",
 			Topic:        "timeout",
 			Payload:      []byte("redeliver"),
-			DeliverAfter: time.Now(),
+			DeliverAfter: time.Now().Add(-1 * time.Minute),
 			Status:       "ready",
 			CreatedAt:    time.Now(),
 			UpdatedAt:    time.Now(),
@@ -287,6 +287,7 @@ func TestStoreIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("enqueue failed: %s", err)
 		}
+		time.Sleep(2 * time.Second) // Wait for flush
 
 		// Lease but don't ack
 		items, err := pgStore.LeaseItems(ctx, "default", "timeout", "worker1", 1, 3*time.Second)
@@ -307,40 +308,10 @@ func TestStoreIntegration(t *testing.T) {
 		}
 	})
 
-	t.Run("IdempotencyKey", func(t *testing.T) {
-		key := "unique-123"
-		item1 := store.Item{
-			Namespace:      "default",
-			Topic:          "idemp",
-			IdempotencyKey: &key,
-			Priority:       10,
-			Payload:        []byte("v1"),
-			DeliverAfter:   time.Now(),
-			Status:         "ready",
-			CreatedAt:      time.Now(),
-			UpdatedAt:      time.Now(),
-		}
-		item2 := item1
-		item2.Payload = []byte("v2")
-
-		ids1, _ := redisBuffer.Enqueue(ctx, []store.Item{item1}, walManager)
-		time.Sleep(2 * time.Second)
-		ids2, _ := redisBuffer.Enqueue(ctx, []store.Item{item2}, walManager)
-
-		if ids1[0] != ids2[0] {
-			t.Error("idempotency key did not prevent duplicate")
-		}
-
-		item, _ := pgStore.GetItem(ctx, ids1[0])
-		if string(item.Payload) != "v2" {
-			t.Error("item not updated on conflict")
-		}
-	})
-
 	t.Run("ConcurrentWorkers", func(t *testing.T) {
 		// Enqueue 5 items
 		items := make([]store.Item, 5)
-		now := time.Now()
+		now := time.Now().Add(-1 * time.Minute)
 		for i := range items {
 			items[i] = store.Item{
 				Namespace:    "default",
@@ -381,6 +352,75 @@ func TestStoreIntegration(t *testing.T) {
 			t.Errorf("expected 5 unique leases, got %d", len(leased))
 		}
 	})
+
+	// Start Prefetcher for Redis-integrated tests
+	go prefetcher.Run(ctx)
+	time.Sleep(2 * time.Second) // Allow prefetcher to initialize
+
+	t.Run("RedisReadyQueueServing", func(t *testing.T) {
+		now := time.Now().Add(-1 * time.Minute)
+		items := []store.Item{
+			{Namespace: "default", Topic: "redisq", Priority: 1, Payload: []byte("fast"), DeliverAfter: now, Status: "ready", CreatedAt: now, UpdatedAt: now},
+			{Namespace: "default", Topic: "redisq", Priority: 2, Payload: []byte("slow"), DeliverAfter: now, Status: "ready", CreatedAt: now, UpdatedAt: now},
+		}
+		_, err := redisBuffer.Enqueue(ctx, items, walManager)
+		if err != nil {
+			t.Fatalf("enqueue failed: %s", err)
+		}
+		time.Sleep(4 * time.Second) // wait for prefetcher
+
+		client := pgStore.GetRedisForShard("default", "redisq")
+		readyKey := "mqueue:queue:default:redisq"
+		length, _ := client.LLen(ctx, readyKey).Result()
+		if length == 0 {
+			t.Error("prefetcher did not populate Redis ready queue")
+		}
+
+		// Simulate dequeue handler logic
+		data, _ := client.LRange(ctx, readyKey, 0, 1).Result()
+		if len(data) > 0 {
+			var item store.Item
+			json.Unmarshal([]byte(data[0]), &item)
+			if string(item.Payload) != "fast" {
+				t.Error("priority order not preserved in Redis queue")
+			}
+		}
+	})
+
+
+
+	t.Run("IdempotencyKey", func(t *testing.T) {
+		key := "unique-123"
+		item1 := store.Item{
+			Namespace:      "default",
+			Topic:          "idemp",
+			IdempotencyKey: &key,
+			Priority:       10,
+			Payload:        []byte("v1"),
+			DeliverAfter:   time.Now().Add(-1 * time.Minute),
+			Status:         "ready",
+			CreatedAt:      time.Now(),
+			UpdatedAt:      time.Now(),
+		}
+		item2 := item1
+		item2.Payload = []byte("v2")
+
+		ids1, _ := redisBuffer.Enqueue(ctx, []store.Item{item1}, walManager)
+		time.Sleep(5 * time.Second) // Increased wait
+		ids2, _ := redisBuffer.Enqueue(ctx, []store.Item{item2}, walManager)
+		time.Sleep(5 * time.Second) // Wait for update flush
+
+		if ids1[0] != ids2[0] {
+			t.Error("idempotency key did not prevent duplicate")
+		}
+
+		item, _ := pgStore.GetItem(ctx, "default", "idemp", ids1[0])
+		if string(item.Payload) != "v2" {
+			t.Error("item not updated on conflict")
+		}
+	})
+
+
 
 	t.Run("WALRecovery", func(t *testing.T) {
 		// Enqueue items

@@ -27,9 +27,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/golang-jwt/jwt/v4"
 	"github.com/redis/go-redis/v9"
-	"github.com/testcontainers/testcontainers-go"
-	"github.com/testcontainers/testcontainers-go/modules/postgres"
-	tcRedis "github.com/testcontainers/testcontainers-go/modules/redis"
+
 )
 
 // Helper to generate a valid JWT for testing
@@ -42,39 +40,23 @@ func generateTestToken(secret, sub string) string {
 	return tokenString
 }
 
+
+
 func TestE2E_HTTP_Flow(t *testing.T) {
 	ctx := context.Background()
 
-	// 1. Setup Infrastructure via TestContainers (Postgres + Redis)
-	// -------------------------------------------------------------------------
-	// Start Postgres
-	pgContainer, err := postgres.RunContainer(ctx,
-		testcontainers.WithImage("postgres:15"),
-		postgres.WithDatabase("mqueue"),
-		postgres.WithUsername("postgres"),
-		postgres.WithPassword("securepassword"),
-	)
+	// 1. Setup Infrastructure
+	dbURL, cleanupDB, err := setupTestDB(ctx)
 	if err != nil {
-		t.Fatalf("failed to start postgres: %s", err)
+		t.Fatalf("setup db failed: %s", err)
 	}
-	defer pgContainer.Terminate(ctx)
+	defer cleanupDB()
 
-	dbURL, err := pgContainer.ConnectionString(ctx, "sslmode=disable")
+	redisAddr, cleanupRedis, err := setupTestRedis(ctx)
 	if err != nil {
-		t.Fatalf("failed to get db url: %s", err)
+		t.Fatalf("setup redis failed: %s", err)
 	}
-
-	// Start Redis
-	redisContainer, err := tcRedis.RunContainer(ctx, testcontainers.WithImage("redis:7"))
-	if err != nil {
-		t.Fatalf("failed to start redis: %s", err)
-	}
-	defer redisContainer.Terminate(ctx)
-
-	redisAddr, err := redisContainer.Endpoint(ctx, "")
-	if err != nil {
-		t.Fatalf("failed to get redis addr: %s", err)
-	}
+	defer cleanupRedis()
 
 	// 2. Setup Application Components
 	// -------------------------------------------------------------------------
@@ -84,7 +66,7 @@ func TestE2E_HTTP_Flow(t *testing.T) {
 	cfg := &config.Config{
 		DatabaseURLs:      []string{dbURL},
 		RedisAddrs:        []string{redisAddr},
-		NamespaceQuotas:   map[string]int{"default": 1000},
+		NamespaceQuotas:   map[string]int{"default": 1000, "e2e": 1000},
 		MaxRetries:        2,
 		WorkerID:          "e2e-worker",
 		LeaseTTL:          5 * time.Second,
@@ -92,6 +74,7 @@ func TestE2E_HTTP_Flow(t *testing.T) {
 		PrefetchBatchSize: 10,
 		FlushInterval:     100 * time.Millisecond,
 		PrefetchInterval:  100 * time.Millisecond,
+		BufferTTL:         1 * time.Minute,
 		WALDir:            walDir,
 		JWTSecret:         "super-secret-test-key",
 	}
@@ -111,6 +94,7 @@ func TestE2E_HTTP_Flow(t *testing.T) {
 	}
 
 	// Schema Init (Manual for tests)
+	time.Sleep(5 * time.Second) // Wait for DB to be fully ready
 	db := pgStore.GetDBs()[0]
 	_, err = db.Exec(`
 		CREATE TABLE IF NOT EXISTS items (
@@ -172,7 +156,7 @@ func TestE2E_HTTP_Flow(t *testing.T) {
 	// 3. Start HTTP Server
 	// -------------------------------------------------------------------------
 	r := chi.NewRouter()
-	server.SetupRouter(r, cfg, pgStore, dlqStore, redisBuffer, retryManager, metrics, walManager)
+	server.SetupRouter(r, cfg, pgStore, dlqStore, redisBuffer, retryManager, metrics, walManager, prefetcher)
 
 	ts := httptest.NewServer(r)
 	defer ts.Close()
@@ -249,7 +233,7 @@ func TestE2E_HTTP_Flow(t *testing.T) {
 
 		// Wait for prefetcher to move item to Redis (if strictly testing redis path)
 		// Or pg fallback might work.
-		time.Sleep(2 * time.Second)
+		time.Sleep(5 * time.Second)
 
 		// Dequeue
 		req, _ = http.NewRequest("GET", baseURL+"/dequeue?namespace=e2e&topic=test-topic&limit=1", nil)
