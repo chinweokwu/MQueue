@@ -37,19 +37,52 @@ mqueue is modeled after **Facebook's FOQS** (Facebook Ordered Queueing Service).
 ---
 
 ## Architecture
+```mermaid
+graph TD
+    Client[Client App]
+    LB[Load Balancer]
+    API[MQueue API Nodes]
+    Redis[Redis Cluster]
+    PG[PostgreSQL Shards]
 
-![Architecture](https://github.com/user-attachments/assets/beb639a6-04b4-4221-8c02-81740a1be6d3)
+    subgraph "MQueue Node"
+        Router[HTTP Router]
+        IDGen[Snowflake ID Gen]
+        Buffer[Redis Buffer]
+        WAL[WAL Manager]
+        Flusher[Flusher Daemon]
+        Prefetch[Prefetch Daemon]
+    end
 
-1.  **Enqueue**: 
-    - Client -> HTTP API -> Snowflake Generator -> Redis Buffer + WAL.
-2.  **Persist**: 
-    - Flusher Daemon -> Drains Redis Buffer -> Bulk Insert to PostgreSQL Shard.
-3.  **Prepare**: 
-    - Prefetcher Daemon -> Scans PostgreSQL for highest priority ready items -> Pushes to Redis Ready Queue.
-4.  **Dequeue**: 
-    - Client -> HTTP API -> Pop from Redis Ready Queue.
-5.  **Clean Up**: 
-    - Client -> HTTP API -> Ack (Delete from Postgres) / Nack (Retry later).
+    Client -->|HTTPS| LB
+    LB --> API
+    API --> Router
+
+    %% Write Path (High Throughput)
+    Router --> IDGen
+    Router -->|1. Enqueue| Buffer
+    Buffer -->|2. Buffer Write| Redis
+    Router -->|3. Log| WAL
+    flusherLoop[Async Loop] -.-> Flusher
+    Flusher -->|4. Drain| Redis
+    Flusher -->|5. Bulk Insert| PG
+
+    %% Read Path (Low Latency)
+    prefetchLoop[Async Loop] -.-> Prefetch
+    Prefetch -->|6. Lease Ready Items| PG
+    Prefetch -->|7. Push to Ready Queue| Redis
+    Router -->|8. Dequeue (LPOP)| Redis
+    
+    %% Ack Path
+    Router -->|9. Ack (DELETE)| PG
+```
+
+### How It Works
+1.  **Enqueue (Write Fast)**: Requests are immediately written to a **Redis Buffer** and a local **WAL** (Write-Ahead Log) for durability. The client receives an ID immediately, without waiting for a database transaction.
+2.  **Persist (Flush)**: Background flushers drain the Redis buffer and performs efficient **Bulk Inserts** into the appropriate **PostgreSQL Shard**.
+3.  **Prepare (Prefetch)**: Background prefetchers scan the database for high-priority, ready-to-process items and push them into a **Redis Ready Queue**.
+4.  **Dequeue (Read Fast)**: Consumers read directly from the **Redis Ready Queue** (FIFO), ensuring sub-millisecond latency.
+5.  **Clean Up (Ack)**: When a consumer finishes a job, it sends an ACK, which deletes the record from PostgreSQL.
 
 ---
 
@@ -120,6 +153,48 @@ curl -k -X POST https://localhost:8080/ack \
     "namespace": "default",
     "topic": "test-topic"
   }'
+```
+
+### 6. Go Client Example
+You can easily integrate MQueue into your Go application:
+
+```go
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"time"
+)
+
+type Item struct {
+	Namespace    string    `json:"namespace"`
+	Topic        string    `json:"topic"`
+	Priority     int       `json:"priority"`
+	Payload      []byte    `json:"payload"`
+	DeliverAfter time.Time `json:"deliver_after"`
+}
+
+func main() {
+	// Enqueue
+	item := Item{
+		Namespace:    "default",
+		Topic:        "orders",
+		Priority:     1,
+		Payload:      []byte("order-123"),
+		DeliverAfter: time.Now(),
+	}
+	body, _ := json.Marshal([]Item{item})
+	req, _ := http.NewRequest("POST", "http://localhost:8080/enqueue", bytes.NewBuffer(body))
+	req.Header.Set("Authorization", "Bearer <JWT>")
+	req.Header.Set("Content-Type", "application/json")
+	
+	resp, _ := http.DefaultClient.Do(req)
+	defer resp.Body.Close()
+	fmt.Println("Enqueued:", resp.Status)
+}
 ```
 
 ---
