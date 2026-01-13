@@ -37,45 +37,7 @@ mqueue is modeled after **Facebook's FOQS** (Facebook Ordered Queueing Service).
 ---
 
 ## Architecture
-```mermaid
-graph TD
-    Client[Client App]
-    LB[Load Balancer]
-    API[MQueue API Nodes]
-    Redis[Redis Cluster]
-    PG[PostgreSQL Shards]
-
-    subgraph "MQueue Node"
-        Router[HTTP Router]
-        IDGen[Snowflake ID Gen]
-        Buffer[Redis Buffer]
-        WAL[WAL Manager]
-        Flusher[Flusher Daemon]
-        Prefetch[Prefetch Daemon]
-    end
-
-    Client -->|HTTPS| LB
-    LB --> API
-    API --> Router
-
-    %% Write Path (High Throughput)
-    Router --> IDGen
-    Router -->|1. Enqueue| Buffer
-    Buffer -->|2. Buffer Write| Redis
-    Router -->|3. Log| WAL
-    flusherLoop[Async Loop] -.-> Flusher
-    Flusher -->|4. Drain| Redis
-    Flusher -->|5. Bulk Insert| PG
-
-    %% Read Path (Low Latency)
-    prefetchLoop[Async Loop] -.-> Prefetch
-    Prefetch -->|6. Lease Ready Items| PG
-    Prefetch -->|7. Push to Ready Queue| Redis
-    Router -->|8. Dequeue (LPOP)| Redis
-    
-    %% Ack Path
-    Router -->|9. Ack (DELETE)| PG
-```
+![Process Architecture](assets/architecture_diagram.png)
 
 ### How It Works
 1.  **Enqueue (Write Fast)**: Requests are immediately written to a **Redis Buffer** and a local **WAL** (Write-Ahead Log) for durability. The client receives an ID immediately, without waiting for a database transaction.
