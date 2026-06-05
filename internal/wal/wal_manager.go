@@ -137,6 +137,9 @@ func (w *WALManager) WriteWAL(shardID int, data []byte) error {
 	if err != nil {
 		return fmt.Errorf("write WAL for shard %d: %w", shardID, err)
 	}
+	if err := f.Sync(); err != nil {
+		return fmt.Errorf("sync WAL for shard %d: %w", shardID, err)
+	}
 	w.fileSizes[shardID] += int64(n)
 	return nil
 }
@@ -171,4 +174,45 @@ func (w *WALManager) Close() error {
 		}
 	}
 	return nil
+}
+
+// RotateForce forces rotation of the active WAL file for the specified shard.
+func (w *WALManager) RotateForce(shardID int) error {
+	return w.rotateFile(shardID)
+}
+
+// ReadAndCleanRotatedWALs reads and returns entries from all rotated WAL files for the shard, then deletes those files.
+func (w *WALManager) ReadAndCleanRotatedWALs(shardID int) ([][]byte, error) {
+	if shardID >= w.numShards {
+		return nil, fmt.Errorf("invalid shard ID %d", shardID)
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	shardDir := filepath.Join(w.baseDir, fmt.Sprintf("shard%d", shardID))
+	files, err := filepath.Glob(filepath.Join(shardDir, "wal-*.log"))
+	if err != nil {
+		return nil, fmt.Errorf("list rotated WAL files for shard %d: %w", shardID, err)
+	}
+
+	var allEntries [][]byte
+	for _, file := range files {
+		data, err := os.ReadFile(file)
+		if err != nil {
+			return nil, fmt.Errorf("read rotated WAL file %s: %w", file, err)
+		}
+		if len(data) > 0 {
+			lines := bytes.Split(data, []byte{'\n'})
+			for _, line := range lines {
+				if len(line) > 0 {
+					allEntries = append(allEntries, line)
+				}
+			}
+		}
+		// Delete file after reading successfully
+		if err := os.Remove(file); err != nil {
+			return nil, fmt.Errorf("delete rotated WAL file %s: %w", file, err)
+		}
+	}
+	return allEntries, nil
 }

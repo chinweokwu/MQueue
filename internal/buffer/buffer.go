@@ -16,14 +16,14 @@ import (
 )
 
 type RedisBuffer struct {
-	clients []*redis.Client
+	clients []redis.UniversalClient
 	cfg     *config.Config
 	store   *store.PGStore
 	logger  *log.Logger
 	node    *id.Node
 }
 
-func NewRedisBuffer(clients []*redis.Client, cfg *config.Config, store *store.PGStore, logger *log.Logger) *RedisBuffer {
+func NewRedisBuffer(clients []redis.UniversalClient, cfg *config.Config, store *store.PGStore, logger *log.Logger) *RedisBuffer {
 	node, err := id.NewNode(cfg.NodeID)
 	if err != nil {
 		logger.Fatal("Failed to initialize ID generator", zap.Error(err))
@@ -42,6 +42,12 @@ func (b *RedisBuffer) Enqueue(ctx context.Context, items []store.Item, wals *wal
 		return nil, nil
 	}
 
+	// Database Pool Saturation check (load shedding)
+	if b.store.IsPoolSaturated() {
+		b.logger.Warn("PostgreSQL connection pool is saturated, rejecting enqueue due to backpressure")
+		return nil, fmt.Errorf("database connection pool saturated (backpressure active)")
+	}
+
 	// Group items by shard (namespace + topic)
 	type shardKey struct {
 		namespace, topic string
@@ -57,6 +63,17 @@ func (b *RedisBuffer) Enqueue(ctx context.Context, items []store.Item, wals *wal
 		shardID := b.store.GetShardID(key.namespace, key.topic)
 		client := b.store.GetRedisForShard(key.namespace, key.topic)
 		listKey := fmt.Sprintf("mqueue:buffer:%s:%s", key.namespace, key.topic)
+		// Backpressure check: check the length of the Redis buffer list
+		listLen, err := client.LLen(ctx, listKey).Result()
+		if err == nil && b.cfg.MaxBufferLength > 0 && int(listLen) >= b.cfg.MaxBufferLength {
+			b.logger.Warn("Queue buffer is full, rejecting enqueue", 
+				zap.String("namespace", key.namespace), 
+				zap.String("topic", key.topic), 
+				zap.Int64("size", listLen), 
+				zap.Int("limit", b.cfg.MaxBufferLength))
+			return nil, fmt.Errorf("queue buffer full for %s:%s (current size: %d, limit: %d)", 
+				key.namespace, key.topic, listLen, b.cfg.MaxBufferLength)
+		}
 
 		// 1. Resolve existing IDs for idempotent items
 		var idKeys []string

@@ -17,16 +17,20 @@ import (
 )
 
 type QueueMetrics struct {
-	EnqueueTotal    *prometheus.CounterVec
-	DequeueTotal    *prometheus.CounterVec
-	AckTotal        *prometheus.CounterVec
-	NackTotal       *prometheus.CounterVec
-	QueueDepth      *prometheus.GaugeVec // Items in buffer (pre-flush)
-	ReadyQueueDepth *prometheus.GaugeVec // Items in prefetched ready queue (fast path)
-	ShardHealth     *prometheus.GaugeVec
-	store           *store.PGStore
-	cfg             *config.Config
-	logger          *log.Logger
+	EnqueueTotal              *prometheus.CounterVec
+	DequeueTotal              *prometheus.CounterVec
+	AckTotal                  *prometheus.CounterVec
+	NackTotal                 *prometheus.CounterVec
+	QueueDepth                *prometheus.GaugeVec // Items in buffer (pre-flush)
+	ReadyQueueDepth           *prometheus.GaugeVec // Items in prefetched ready queue (fast path)
+	ShardHealth               *prometheus.GaugeVec
+	BackpressureRejectedTotal *prometheus.CounterVec
+	EnqueueDuration           *prometheus.HistogramVec
+	DequeueDuration           *prometheus.HistogramVec
+	FlushDuration             *prometheus.HistogramVec
+	store                     *store.PGStore
+	cfg                       *config.Config
+	logger                    *log.Logger
 }
 
 func NewQueueMetrics(store *store.PGStore, cfg *config.Config, logger *log.Logger) *QueueMetrics {
@@ -80,6 +84,37 @@ func NewQueueMetrics(store *store.PGStore, cfg *config.Config, logger *log.Logge
 			},
 			[]string{"shard", "type"},
 		),
+		BackpressureRejectedTotal: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "mqueue_backpressure_rejected_total",
+				Help: "Total number of enqueues rejected due to backpressure limits",
+			},
+			[]string{"namespace", "topic"},
+		),
+		EnqueueDuration: prometheus.NewHistogramVec(
+			prometheus.HistogramOpts{
+				Name:    "mqueue_enqueue_latency_seconds",
+				Help:    "Latency of enqueue operations in seconds",
+				Buckets: prometheus.DefBuckets,
+			},
+			[]string{"namespace", "topic"},
+		),
+		DequeueDuration: prometheus.NewHistogramVec(
+			prometheus.HistogramOpts{
+				Name:    "mqueue_dequeue_latency_seconds",
+				Help:    "Latency of dequeue operations in seconds",
+				Buckets: prometheus.DefBuckets,
+			},
+			[]string{"namespace", "topic"},
+		),
+		FlushDuration: prometheus.NewHistogramVec(
+			prometheus.HistogramOpts{
+				Name:    "mqueue_flush_latency_seconds",
+				Help:    "Latency of db flush operations in seconds",
+				Buckets: prometheus.DefBuckets,
+			},
+			[]string{"namespace", "topic"},
+		),
 		store:  store,
 		cfg:    cfg,
 		logger: logger,
@@ -93,6 +128,10 @@ func NewQueueMetrics(store *store.PGStore, cfg *config.Config, logger *log.Logge
 		metrics.QueueDepth,
 		metrics.ReadyQueueDepth,
 		metrics.ShardHealth,
+		metrics.BackpressureRejectedTotal,
+		metrics.EnqueueDuration,
+		metrics.DequeueDuration,
+		metrics.FlushDuration,
 	)
 
 	return metrics

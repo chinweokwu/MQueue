@@ -8,6 +8,7 @@ import (
 	"mqueue/internal/buffer"
 	"mqueue/internal/config"
 	"mqueue/internal/log"
+	"mqueue/internal/metrics"
 	"mqueue/internal/store"
 
 	"github.com/sony/gobreaker"
@@ -15,11 +16,12 @@ import (
 )
 
 type Flusher struct {
-	buffer *buffer.RedisBuffer
-	store  *store.PGStore
-	cfg    *config.Config
-	logger *log.Logger
-	cb     *gobreaker.CircuitBreaker
+	buffer  *buffer.RedisBuffer
+	store   *store.PGStore
+	cfg     *config.Config
+	logger  *log.Logger
+	cb      *gobreaker.CircuitBreaker
+	metrics *metrics.QueueMetrics
 }
 
 func NewFlusher(buffer *buffer.RedisBuffer, store *store.PGStore, cfg *config.Config, logger *log.Logger) *Flusher {
@@ -39,6 +41,12 @@ func NewFlusher(buffer *buffer.RedisBuffer, store *store.PGStore, cfg *config.Co
 		logger: logger,
 		cb:     cb,
 	}
+}
+
+// WithMetrics registers the metrics collector instance for the flusher
+func (f *Flusher) WithMetrics(metrics *metrics.QueueMetrics) *Flusher {
+	f.metrics = metrics
+	return f
 }
 
 func (f *Flusher) Run(ctx context.Context) {
@@ -82,12 +90,16 @@ func (f *Flusher) flush(ctx context.Context, namespace, topic string) error {
 		return nil
 	}
 
+	start := time.Now()
 	ids, err := f.cb.Execute(func() (interface{}, error) {
 		return f.store.UpsertItems(ctx, items)
 	})
 	if err != nil {
 		f.logger.Error("Failed to upsert items", zap.Error(err))
 		return fmt.Errorf("upsert items: %w", err)
+	}
+	if f.metrics != nil {
+		f.metrics.FlushDuration.WithLabelValues(namespace, topic).Observe(time.Since(start).Seconds())
 	}
 
 	// Collect item IDs for deletion
@@ -102,4 +114,8 @@ func (f *Flusher) flush(ctx context.Context, namespace, topic string) error {
 
 	f.logger.Info("Flushed items", zap.Int("count", len(ids.([]int64))))
 	return nil
+}
+
+func (f *Flusher) FlushAll(ctx context.Context) {
+	f.flushAll(ctx)
 }

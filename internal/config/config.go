@@ -38,6 +38,9 @@ type Config struct {
 	LogLevel          string
 	LogEncoding       string
 	WALRetention      time.Duration
+	RedisClusterMode  bool
+	RedisSentinelMaster string
+	MaxBufferLength   int
 }
 
 func Load() (*Config, error) {
@@ -55,10 +58,27 @@ func Load() (*Config, error) {
 	nodeID, _ := strconv.ParseInt(nodeIDStr, 10, 64)
 
 	logger := log.NewLogger()
+	loadSecretFromFile := func(envKey string, fallback string) string {
+		fileVar := envKey + "_FILE"
+		filePath := os.Getenv(fileVar)
+		if filePath != "" {
+			data, err := os.ReadFile(filePath)
+			if err == nil {
+				return strings.TrimSpace(string(data))
+			}
+			logger.Warn("Failed to read secret from file path", zap.String("var", fileVar), zap.String("path", filePath), zap.Error(err))
+		}
+		return getEnv(envKey, fallback)
+	}
+
+	databaseURLsVal := loadSecretFromFile("DATABASE_URLS", "")
+	redisPasswordVal := loadSecretFromFile("REDIS_PASSWORD", "")
+	jwtSecretVal := loadSecretFromFile("JWT_SECRET", "")
+
 	cfg := &Config{
-		DatabaseURLs:      strings.Split(os.Getenv("DATABASE_URLS"), ","),
+		DatabaseURLs:      strings.Split(databaseURLsVal, ","),
 		RedisAddrs:        strings.Split(os.Getenv("REDIS_ADDRS"), ","),
-		RedisPassword:     os.Getenv("REDIS_PASSWORD"),
+		RedisPassword:     redisPasswordVal,
 		WALDir:            os.Getenv("WAL_DIR"),
 		Namespace:         "default",
 		Topic:             "tasks",
@@ -74,12 +94,15 @@ func Load() (*Config, error) {
 		RetryBackoff:      1 * time.Second,
 		NamespaceQuotas:   make(map[string]int),
 		DeliveryMode:      os.Getenv("DELIVERY_MODE"),
-		JWTSecret:         os.Getenv("JWT_SECRET"),
+		JWTSecret:         jwtSecretVal,
 		WorkerID:          os.Getenv("WORKER_ID"),
 		NodeID:            nodeID,
 		LogLevel:          getEnv("LOG_LEVEL", "info"),
 		LogEncoding:       getEnv("LOG_ENCODING", "json"),
 		WALRetention:      24 * time.Hour,
+		RedisClusterMode:  os.Getenv("REDIS_CLUSTER_MODE") == "true",
+		RedisSentinelMaster: os.Getenv("REDIS_SENTINEL_MASTER"),
+		MaxBufferLength:   getEnvAsInt("MAX_BUFFER_LENGTH", 100000),
 	}
 
 	if retentionStr := os.Getenv("WAL_RETENTION"); retentionStr != "" {
@@ -138,6 +161,15 @@ func Load() (*Config, error) {
 func getEnv(key, fallback string) string {
 	if value, ok := os.LookupEnv(key); ok {
 		return value
+	}
+	return fallback
+}
+
+func getEnvAsInt(key string, fallback int) int {
+	if value, ok := os.LookupEnv(key); ok {
+		if i, err := strconv.Atoi(value); err == nil {
+			return i
+		}
 	}
 	return fallback
 }

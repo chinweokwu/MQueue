@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"sync"
+	"strings"
 	"syscall"
 	"time"
 
@@ -17,8 +18,10 @@ import (
 	"mqueue/internal/log"
 	"mqueue/internal/metrics"
 	"mqueue/internal/prefetch"
+	"mqueue/internal/recovery"
 	"mqueue/internal/retry"
 	"mqueue/internal/server"
+	"mqueue/internal/id"
 	"mqueue/internal/store"
 	"mqueue/internal/wal"
 
@@ -37,14 +40,54 @@ func main() {
 	logger = log.NewFromConfig(cfg.LogLevel, cfg.LogEncoding)
 	defer logger.Sync()
 
-	redisClients := make([]*redis.Client, len(cfg.RedisAddrs))
-	for i, addr := range cfg.RedisAddrs {
-		redisClients[i] = redis.NewClient(&redis.Options{
-			Addr:     addr,
+	var redisClients []redis.UniversalClient
+	if cfg.RedisClusterMode {
+		clusterClient := redis.NewClusterClient(&redis.ClusterOptions{
+			Addrs:    cfg.RedisAddrs,
 			Password: cfg.RedisPassword,
 		})
-		if err := redisClients[i].Ping(context.Background()).Err(); err != nil {
-			logger.Fatal("Failed to connect to Redis", zap.Error(err), zap.Int("index", i))
+		if err := clusterClient.Ping(context.Background()).Err(); err != nil {
+			logger.Fatal("Failed to connect to Redis Cluster", zap.Error(err))
+		}
+		// Map same cluster client to all database shards
+		redisClients = make([]redis.UniversalClient, len(cfg.DatabaseURLs))
+		for i := range redisClients {
+			redisClients[i] = clusterClient
+		}
+	} else if cfg.RedisSentinelMaster != "" {
+		sentinelClient := redis.NewFailoverClient(&redis.FailoverOptions{
+			MasterName:    cfg.RedisSentinelMaster,
+			SentinelAddrs: cfg.RedisAddrs,
+			Password:      cfg.RedisPassword,
+		})
+		if err := sentinelClient.Ping(context.Background()).Err(); err != nil {
+			logger.Fatal("Failed to connect to Redis Sentinel", zap.Error(err))
+		}
+		// Map same failover client to all database shards
+		redisClients = make([]redis.UniversalClient, len(cfg.DatabaseURLs))
+		for i := range redisClients {
+			redisClients[i] = sentinelClient
+		}
+	} else {
+		redisClients = make([]redis.UniversalClient, len(cfg.RedisAddrs))
+		for i, addr := range cfg.RedisAddrs {
+			var opt *redis.Options
+			if strings.HasPrefix(addr, "redis://") || strings.HasPrefix(addr, "rediss://") {
+				var err error
+				opt, err = redis.ParseURL(addr)
+				if err != nil {
+					logger.Fatal("Failed to parse Redis URL", zap.Error(err), zap.String("addr", addr))
+				}
+			} else {
+				opt = &redis.Options{
+					Addr:     addr,
+					Password: cfg.RedisPassword,
+				}
+			}
+			redisClients[i] = redis.NewClient(opt)
+			if err := redisClients[i].Ping(context.Background()).Err(); err != nil {
+				logger.Fatal("Failed to connect to Redis", zap.Error(err), zap.Int("index", i))
+			}
 		}
 	}
 
@@ -81,12 +124,29 @@ func main() {
 		logger.Fatal("Failed to recover from WAL", zap.Error(err))
 	}
 
+	var leaseManager *id.LeaseManager
+	if len(redisClients) > 0 {
+		leaseManager = id.NewLeaseManager(redisClients[0], cfg.WorkerID)
+		acquiredID, err := leaseManager.Acquire(context.Background())
+		if err != nil {
+			logger.Fatal("Failed to acquire dynamic Snowflake Node ID lease", zap.Error(err))
+		}
+		cfg.NodeID = acquiredID
+		logger.Info("Acquired dynamic Snowflake Node ID lease", zap.Int64("node_id", cfg.NodeID))
+
+		// Start renewal loop in background
+		leaseManager.StartRenewalLoop(context.Background(), func() {
+			logger.Fatal("Lost Snowflake Node ID lease from Redis. Shutting down server to prevent ID collisions.")
+		})
+	}
+
 	metrics := metrics.NewQueueMetrics(pgStore, cfg, logger)
 	redisBuffer := buffer.NewRedisBuffer(redisClients, cfg, pgStore, logger)
-	flusher := flusher.NewFlusher(redisBuffer, pgStore, cfg, logger)
+	flusher := flusher.NewFlusher(redisBuffer, pgStore, cfg, logger).WithMetrics(metrics)
 	prefetcher := prefetch.NewRedisPrefetcher(redisClients, pgStore, cfg, logger)
 	leaseDaemon := lease.NewLeaseDaemon(redisClients, pgStore, cfg, logger)
 	retryManager := retry.NewRetryManager(pgStore, dlqStore, cfg, logger)
+	recoveryDaemon := recovery.NewRecoveryDaemon(redisClients, pgStore, walManager, cfg, logger)
 
 	// Context for background workers
 	ctx, cancel := context.WithCancel(context.Background())
@@ -107,6 +167,7 @@ func main() {
 	runDaemon("Prefetcher", prefetcher.Run)
 	runDaemon("LeaseDaemon", leaseDaemon.Run)
 	runDaemon("Metrics", metrics.Run)
+	runDaemon("RecoveryDaemon", recoveryDaemon.Run)
 
 	// Periodic Task: Clean Empty Topics
 	wg.Add(1)
@@ -163,6 +224,19 @@ func main() {
 		tlsConfig = &tls.Config{
 			Certificates: []tls.Certificate{cert},
 			MinVersion:   tls.VersionTLS12,
+			CipherSuites: []uint16{
+				tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+				tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+				tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+				tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+				tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+				tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+			},
+			CurvePreferences: []tls.CurveID{
+				tls.CurveP256,
+				tls.X25519,
+			},
+			PreferServerCipherSuites: true,
 		}
 	} else {
 		logger.Warn("TLS_CERT_FILE or TLS_KEY_FILE not set, using HTTP")
@@ -207,5 +281,9 @@ func main() {
 	// 3. Wait for workers to finish
 	logger.Info("Waiting for background tasks to finish...")
 	wg.Wait()
+	if leaseManager != nil {
+		leaseManager.Close()
+		logger.Info("Snowflake Node ID lease released successfully")
+	}
 	logger.Info("All background tasks finished")
 }

@@ -4,8 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"net/http"
+	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"mqueue/internal/buffer"
@@ -18,14 +21,14 @@ import (
 	"mqueue/internal/wal"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/go-chi/httprate"
 	"github.com/golang-jwt/jwt/v4"
 	"go.uber.org/zap"
 )
 
 func SetupRouter(r *chi.Mux, cfg *config.Config, pgStore *store.PGStore, dlqStore *store.DLQStore, buffer *buffer.RedisBuffer, retryManager *retry.RetryManager, metrics *metrics.QueueMetrics, walManager *wal.WALManager, prefetcher *prefetch.RedisPrefetcher) {
 	logger := log.NewLogger()
-	r.Use(httprate.Limit(100, time.Minute, httprate.WithKeyFuncs(httprate.KeyByIP)))
+	r.Use(securityHeadersMiddleware)
+	r.Use(redisRateLimitMiddleware(pgStore, 100, time.Minute, logger))
 	// r.Use(authMiddleware(cfg.JWTSecret, logger))
 
 	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
@@ -45,6 +48,8 @@ func SetupRouter(r *chi.Mux, cfg *config.Config, pgStore *store.PGStore, dlqStor
 		}
 		w.Write([]byte("OK"))
 	})
+	r.Get("/dashboard", ServeDashboard(cfg.JWTSecret))
+
 	r.Group(func(r chi.Router) {
 		r.Use(authMiddleware(cfg.JWTSecret, logger))
 		r.Get("/topics", func(w http.ResponseWriter, r *http.Request) {
@@ -52,6 +57,11 @@ func SetupRouter(r *chi.Mux, cfg *config.Config, pgStore *store.PGStore, dlqStor
 			if namespace == "" {
 				logger.Error("Missing namespace parameter")
 				http.Error(w, "Missing namespace", http.StatusBadRequest)
+				return
+			}
+			if !isScopeAllowed(r.Context(), namespace, "read") {
+				logger.Error("Forbidden namespace access", zap.String("namespace", namespace))
+				http.Error(w, "Forbidden", http.StatusForbidden)
 				return
 			}
 			topics, err := pgStore.GetActiveTopics(r.Context(), namespace)
@@ -81,6 +91,13 @@ func SetupRouter(r *chi.Mux, cfg *config.Config, pgStore *store.PGStore, dlqStor
 				http.Error(w, "Invalid request body", http.StatusBadRequest)
 				return
 			}
+			for _, item := range reqItems {
+				if !isScopeAllowed(r.Context(), item.Namespace, "write") {
+					logger.Error("Forbidden namespace access in enqueue", zap.String("namespace", item.Namespace))
+					http.Error(w, "Forbidden", http.StatusForbidden)
+					return
+				}
+			}
 			items := make([]store.Item, len(reqItems))
 			now := time.Now()
 			for i, reqItem := range reqItems {
@@ -100,11 +117,15 @@ func SetupRouter(r *chi.Mux, cfg *config.Config, pgStore *store.PGStore, dlqStor
 			start := time.Now()
 			ids, err := buffer.Enqueue(r.Context(), items, walManager)
 			if err != nil {
+				if strings.Contains(err.Error(), "queue buffer full") {
+					metrics.BackpressureRejectedTotal.WithLabelValues(items[0].Namespace, items[0].Topic).Inc()
+				}
 				logger.Error("Failed to enqueue items", zap.Error(err))
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
 			metrics.EnqueueTotal.WithLabelValues(items[0].Namespace, items[0].Topic).Add(float64(len(items)))
+			metrics.EnqueueDuration.WithLabelValues(items[0].Namespace, items[0].Topic).Observe(time.Since(start).Seconds())
 			if err := json.NewEncoder(w).Encode(ids); err != nil {
 				logger.Error("Failed to encode enqueue response", zap.Error(err))
 				http.Error(w, "Failed to encode response", http.StatusInternalServerError)
@@ -123,6 +144,11 @@ func SetupRouter(r *chi.Mux, cfg *config.Config, pgStore *store.PGStore, dlqStor
 			if namespace == "" || topic == "" {
 				logger.Error("Missing namespace or topic")
 				http.Error(w, "Missing namespace or topic", http.StatusBadRequest)
+				return
+			}
+			if !isScopeAllowed(r.Context(), namespace, "read") {
+				logger.Error("Forbidden namespace access in dequeue", zap.String("namespace", namespace))
+				http.Error(w, "Forbidden", http.StatusForbidden)
 				return
 			}
 
@@ -158,14 +184,14 @@ func SetupRouter(r *chi.Mux, cfg *config.Config, pgStore *store.PGStore, dlqStor
 				needed := limit - len(items)
 				dbItems, err := pgStore.LeaseItems(r.Context(), namespace, topic, cfg.WorkerID, needed, cfg.LeaseTTL)
 				if err != nil {
-					logger.Error("Failed to lease items from DB", zap.Error(err))
-					http.Error(w, err.Error(), http.StatusInternalServerError)
-					return
+					logger.Warn("Failed to lease items from DB (running in degraded mode)", zap.Error(err))
+				} else {
+					items = append(items, dbItems...)
 				}
-				items = append(items, dbItems...)
 			}
 
 			metrics.DequeueTotal.WithLabelValues(namespace, topic).Add(float64(len(items)))
+			metrics.DequeueDuration.WithLabelValues(namespace, topic).Observe(time.Since(start).Seconds())
 			if err := json.NewEncoder(w).Encode(items); err != nil {
 				logger.Error("Failed to encode dequeue response", zap.Error(err))
 				http.Error(w, "Failed to encode response", http.StatusInternalServerError)
@@ -183,6 +209,11 @@ func SetupRouter(r *chi.Mux, cfg *config.Config, pgStore *store.PGStore, dlqStor
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 				logger.Error("Failed to decode ack request", zap.Error(err))
 				http.Error(w, "Invalid request body", http.StatusBadRequest)
+				return
+			}
+			if !isScopeAllowed(r.Context(), req.Namespace, "write") {
+				logger.Error("Forbidden namespace access in ack", zap.String("namespace", req.Namespace))
+				http.Error(w, "Forbidden", http.StatusForbidden)
 				return
 			}
 			start := time.Now()
@@ -206,6 +237,11 @@ func SetupRouter(r *chi.Mux, cfg *config.Config, pgStore *store.PGStore, dlqStor
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 				logger.Error("Failed to decode nack request", zap.Error(err))
 				http.Error(w, "Invalid request body", http.StatusBadRequest)
+				return
+			}
+			if !isScopeAllowed(r.Context(), req.Namespace, "write") {
+				logger.Error("Forbidden namespace access in nack", zap.String("namespace", req.Namespace))
+				http.Error(w, "Forbidden", http.StatusForbidden)
 				return
 			}
 			item, err := pgStore.GetItem(r.Context(), req.Namespace, req.Topic, req.ID)
@@ -237,6 +273,11 @@ func SetupRouter(r *chi.Mux, cfg *config.Config, pgStore *store.PGStore, dlqStor
 				http.Error(w, "Missing namespace or topic", http.StatusBadRequest)
 				return
 			}
+			if !isScopeAllowed(r.Context(), namespace, "read") {
+				logger.Error("Forbidden namespace access in dlq get", zap.String("namespace", namespace))
+				http.Error(w, "Forbidden", http.StatusForbidden)
+				return
+			}
 			items, err := dlqStore.GetDLQItems(r.Context(), namespace, topic, limit)
 			if err != nil {
 				logger.Error("Failed to get DLQ items", zap.Error(err))
@@ -260,6 +301,11 @@ func SetupRouter(r *chi.Mux, cfg *config.Config, pgStore *store.PGStore, dlqStor
 				http.Error(w, "Invalid request body", http.StatusBadRequest)
 				return
 			}
+			if !isScopeAllowed(r.Context(), req.Namespace, "write") {
+				logger.Error("Forbidden namespace access in dlq delete", zap.String("namespace", req.Namespace))
+				http.Error(w, "Forbidden", http.StatusForbidden)
+				return
+			}
 			if err := dlqStore.DeleteDLQItem(r.Context(), req.ID, req.Namespace, req.Topic); err != nil {
 				logger.Error("Failed to delete DLQ item", zap.Error(err), zap.Int64("id", req.ID))
 				http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -267,6 +313,51 @@ func SetupRouter(r *chi.Mux, cfg *config.Config, pgStore *store.PGStore, dlqStor
 			}
 			logger.Info("Deleted DLQ item", zap.Int64("id", req.ID))
 			w.Write([]byte("OK"))
+		})
+
+		r.Get("/api/dashboard/stats", func(w http.ResponseWriter, r *http.Request) {
+			type ShardStats struct {
+				ID      int  `json:"id"`
+				Healthy bool `json:"healthy"`
+			}
+			var pgShards []ShardStats
+			for i := range pgStore.GetDBs() {
+				pgShards = append(pgShards, ShardStats{
+					ID:      i,
+					Healthy: pgStore.IsShardHealthy(i),
+				})
+			}
+
+			var redisShards []ShardStats
+			for i, client := range pgStore.GetRedisClients() {
+				healthy := client.Ping(r.Context()).Err() == nil
+				redisShards = append(redisShards, ShardStats{
+					ID:      i,
+					Healthy: healthy,
+				})
+			}
+
+			var dbPoolInUse int
+			var dbPoolMaxOpen int
+			for _, db := range pgStore.GetDBs() {
+				stats := db.Stats()
+				dbPoolInUse += stats.InUse
+				dbPoolMaxOpen += stats.MaxOpenConnections
+			}
+			dbPoolSaturation := 0.0
+			if dbPoolMaxOpen > 0 {
+				dbPoolSaturation = float64(dbPoolInUse) / float64(dbPoolMaxOpen) * 100.0
+			}
+
+			response := map[string]interface{}{
+				"pg_shards":          pgShards,
+				"redis_shards":       redisShards,
+				"db_pool_saturation": dbPoolSaturation,
+				"served_by":          os.Getenv("HOSTNAME"),
+				"timestamp":          time.Now().Unix(),
+			}
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(response)
 		})
 	})
 }
@@ -296,6 +387,144 @@ func authMiddleware(jwtSecret string, logger *log.Logger) func(http.Handler) htt
 			}
 			ctx := context.WithValue(r.Context(), "claims", token.Claims)
 			next.ServeHTTP(w, r.WithContext(ctx))
+		})
+	}
+}
+
+func isNamespaceAllowed(ctx context.Context, namespace string) bool {
+	return isScopeAllowed(ctx, namespace, "read") || isScopeAllowed(ctx, namespace, "write")
+}
+
+func isScopeAllowed(ctx context.Context, namespace, action string) bool {
+	claims, ok := ctx.Value("claims").(jwt.MapClaims)
+	if !ok {
+		return false
+	}
+
+	// 1. Check granular "scopes" claim
+	if scopesVal, ok := claims["scopes"]; ok {
+		if slice, ok := scopesVal.([]interface{}); ok {
+			for _, s := range slice {
+				str, ok := s.(string)
+				if !ok {
+					continue
+				}
+				parts := strings.Split(str, ":")
+				if len(parts) == 2 {
+					nsPattern := parts[0]
+					actPattern := parts[1]
+					if (nsPattern == namespace || nsPattern == "*") && (actPattern == action || actPattern == "*") {
+						return true
+					}
+				}
+			}
+		}
+		if slice, ok := scopesVal.([]string); ok {
+			for _, str := range slice {
+				parts := strings.Split(str, ":")
+				if len(parts) == 2 {
+					nsPattern := parts[0]
+					actPattern := parts[1]
+					if (nsPattern == namespace || nsPattern == "*") && (actPattern == action || actPattern == "*") {
+						return true
+					}
+				}
+			}
+		}
+	}
+
+	// 2. Check legacy "allowed_namespaces" claim
+	allowed, ok := claims["allowed_namespaces"]
+	if !ok {
+		return false
+	}
+
+	if str, ok := allowed.(string); ok && str == "*" {
+		return true
+	}
+
+	if slice, ok := allowed.([]interface{}); ok {
+		for _, item := range slice {
+			if str, ok := item.(string); ok && (str == namespace || str == "*") {
+				return true
+			}
+		}
+	}
+
+	if slice, ok := allowed.([]string); ok {
+		for _, item := range slice {
+			if item == namespace || item == "*" {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+func securityHeadersMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("X-XSS-Protection", "1; mode=block")
+		w.Header().Set("Strict-Transport-Security", "max-age=63072000; includeSubDomains; preload")
+		if strings.HasPrefix(r.URL.Path, "/dashboard") || strings.HasPrefix(r.URL.Path, "/api/dashboard") {
+			w.Header().Set("Content-Security-Policy", "default-src 'self' https://fonts.googleapis.com https://fonts.gstatic.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; script-src 'self' 'unsafe-inline'; connect-src 'self'")
+		} else {
+			w.Header().Set("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'; sandbox")
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func redisRateLimitMiddleware(pgStore *store.PGStore, limit int, window time.Duration, logger *log.Logger) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			ip := r.RemoteAddr
+			if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+				ip = strings.Split(xff, ",")[0]
+			}
+
+			redisClients := pgStore.GetRedisClients()
+			if len(redisClients) == 0 {
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			h := fnv.New32a()
+			h.Write([]byte(ip))
+			redisIdx := int(h.Sum32() % uint32(len(redisClients)))
+			rdb := redisClients[redisIdx]
+
+			now := time.Now()
+			key := fmt.Sprintf("mqueue:ratelimit:%s:%d", ip, now.Unix()/int64(window.Seconds()))
+
+			ctx := r.Context()
+			count, err := rdb.Incr(ctx, key).Result()
+			if err == nil && count == 1 {
+				rdb.Expire(ctx, key, window*2)
+			}
+
+			if err != nil {
+				logger.Warn("Rate limit Redis error (fail-open)", zap.Error(err))
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			w.Header().Set("X-RateLimit-Limit", strconv.Itoa(limit))
+			remaining := limit - int(count)
+			if remaining < 0 {
+				remaining = 0
+			}
+			w.Header().Set("X-RateLimit-Remaining", strconv.Itoa(remaining))
+
+			if count > int64(limit) {
+				logger.Warn("Rate limit exceeded", zap.String("ip", ip), zap.Int64("count", count))
+				http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
+				return
+			}
+
+			next.ServeHTTP(w, r)
 		})
 	}
 }

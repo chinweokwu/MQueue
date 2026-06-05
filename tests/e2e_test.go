@@ -31,10 +31,21 @@ import (
 )
 
 // Helper to generate a valid JWT for testing
-func generateTestToken(secret, sub string) string {
+func generateTestToken(secret, sub string, allowedNamespaces []string) string {
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
 		"sub": sub,
 		"exp": time.Now().Add(time.Hour).Unix(),
+		"allowed_namespaces": allowedNamespaces,
+	})
+	tokenString, _ := token.SignedString([]byte(secret))
+	return tokenString
+}
+
+func generateScopedTestToken(secret, sub string, scopes []string) string {
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"sub": sub,
+		"exp": time.Now().Add(time.Hour).Unix(),
+		"scopes": scopes,
 	})
 	tokenString, _ := token.SignedString([]byte(secret))
 	return tokenString
@@ -67,7 +78,7 @@ func TestE2E_HTTP_Flow(t *testing.T) {
 		DatabaseURLs:      []string{dbURL},
 		RedisAddrs:        []string{redisAddr},
 		NamespaceQuotas:   map[string]int{"default": 1000, "e2e": 1000},
-		MaxRetries:        2,
+		MaxRetries:        3,
 		WorkerID:          "e2e-worker",
 		LeaseTTL:          5 * time.Second,
 		WorkerBatchSize:   10,
@@ -82,9 +93,10 @@ func TestE2E_HTTP_Flow(t *testing.T) {
 	// Clients
 	redisClient := redis.NewClient(&redis.Options{Addr: redisAddr})
 	defer redisClient.Close()
+	redisClient.FlushDB(ctx)
 
 	// Store
-	pgStore, err := store.NewPGStore(cfg.DatabaseURLs, []*redis.Client{redisClient}, cfg)
+	pgStore, err := store.NewPGStore(cfg.DatabaseURLs, []redis.UniversalClient{redisClient}, cfg)
 	if err != nil {
 		t.Fatalf("failed to init pgStore: %v", err)
 	}
@@ -141,11 +153,11 @@ func TestE2E_HTTP_Flow(t *testing.T) {
 	defer walManager.Close()
 
 	metrics := metrics.NewQueueMetrics(pgStore, cfg, logger)
-	redisBuffer := buffer.NewRedisBuffer([]*redis.Client{redisClient}, cfg, pgStore, logger)
+	redisBuffer := buffer.NewRedisBuffer([]redis.UniversalClient{redisClient}, cfg, pgStore, logger)
 	retryManager := retry.NewRetryManager(pgStore, dlqStore, cfg, logger)
 
 	// Start Daemons (Prefetcher is critical for Dequeue to work from Redis)
-	prefetcher := prefetch.NewRedisPrefetcher([]*redis.Client{redisClient}, pgStore, cfg, logger)
+	prefetcher := prefetch.NewRedisPrefetcher([]redis.UniversalClient{redisClient}, pgStore, cfg, logger)
 	flusher := flusher.NewFlusher(redisBuffer, pgStore, cfg, logger)
 
 	ctxDaemons, cancelDaemons := context.WithCancel(ctx)
@@ -163,7 +175,7 @@ func TestE2E_HTTP_Flow(t *testing.T) {
 
 	client := ts.Client()
 	baseURL := ts.URL
-	userToken := generateTestToken(cfg.JWTSecret, "test-user")
+	userToken := generateTestToken(cfg.JWTSecret, "test-user", []string{"*"})
 	authHeader := "Bearer " + userToken
 
 	// 4. Execute Test Scenarios
@@ -335,26 +347,122 @@ func TestE2E_HTTP_Flow(t *testing.T) {
 			t.Error("Item not found in DLQ after max retries")
 		}
 	})
+
+	t.Run("NamespaceAuthorization", func(t *testing.T) {
+		restrictedToken := generateTestToken(cfg.JWTSecret, "tenant-user", []string{"tenant-a"})
+		restrictedAuthHeader := "Bearer " + restrictedToken
+
+		req, _ := http.NewRequest("GET", baseURL+"/dequeue?namespace=tenant-a&topic=test-topic&limit=1", nil)
+		req.Header.Set("Authorization", restrictedAuthHeader)
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode == http.StatusForbidden {
+			t.Errorf("expected access to tenant-a to be allowed, got 403")
+		}
+
+		reqForbidden, _ := http.NewRequest("GET", baseURL+"/dequeue?namespace=e2e&topic=test-topic&limit=1", nil)
+		reqForbidden.Header.Set("Authorization", restrictedAuthHeader)
+		respForbidden, err := client.Do(reqForbidden)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer respForbidden.Body.Close()
+		if respForbidden.StatusCode != http.StatusForbidden {
+			t.Errorf("expected access to e2e namespace to be forbidden, got %d", respForbidden.StatusCode)
+		}
+	})
+
+	t.Run("GranularScopes", func(t *testing.T) {
+		readToken := generateScopedTestToken(cfg.JWTSecret, "tenant-reader", []string{"tenant-b:read"})
+		readAuthHeader := "Bearer " + readToken
+
+		writeToken := generateScopedTestToken(cfg.JWTSecret, "tenant-writer", []string{"tenant-b:write"})
+		writeAuthHeader := "Bearer " + writeToken
+
+		// 1. Reader tries to dequeue (should succeed / status 200)
+		reqRead, _ := http.NewRequest("GET", baseURL+"/dequeue?namespace=tenant-b&topic=test-topic&limit=1", nil)
+		reqRead.Header.Set("Authorization", readAuthHeader)
+		respRead, err := client.Do(reqRead)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer respRead.Body.Close()
+		if respRead.StatusCode == http.StatusForbidden {
+			t.Error("expected reader to have access to dequeue, got 403")
+		}
+
+		// 2. Reader tries to enqueue (should fail / status 403)
+		payload := []map[string]interface{}{
+			{
+				"namespace": "tenant-b",
+				"topic":     "test-topic",
+				"payload":   []byte("test"),
+			},
+		}
+		bodyBytes, _ := json.Marshal(payload)
+		reqWriteForbidden, _ := http.NewRequest("POST", baseURL+"/enqueue", bytes.NewReader(bodyBytes))
+		reqWriteForbidden.Header.Set("Authorization", readAuthHeader)
+		respWriteForbidden, err := client.Do(reqWriteForbidden)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer respWriteForbidden.Body.Close()
+		if respWriteForbidden.StatusCode != http.StatusForbidden {
+			t.Errorf("expected reader to be forbidden from enqueue, got %d", respWriteForbidden.StatusCode)
+		}
+
+		// 3. Writer tries to enqueue (should succeed / status 200)
+		reqWrite, _ := http.NewRequest("POST", baseURL+"/enqueue", bytes.NewReader(bodyBytes))
+		reqWrite.Header.Set("Authorization", writeAuthHeader)
+		respWrite, err := client.Do(reqWrite)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer respWrite.Body.Close()
+		if respWrite.StatusCode == http.StatusForbidden {
+			t.Error("expected writer to have access to enqueue, got 403")
+		}
+
+		// 4. Writer tries to dequeue (should fail / status 403)
+		reqReadForbidden, _ := http.NewRequest("GET", baseURL+"/dequeue?namespace=tenant-b&topic=test-topic&limit=1", nil)
+		reqReadForbidden.Header.Set("Authorization", writeAuthHeader)
+		respReadForbidden, err := client.Do(reqReadForbidden)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer respReadForbidden.Body.Close()
+		if respReadForbidden.StatusCode != http.StatusForbidden {
+			t.Errorf("expected writer to be forbidden from dequeue, got %d", respReadForbidden.StatusCode)
+		}
+	})
 }
 
 func leaseAndNack(t *testing.T, client *http.Client, baseURL, authHeader, topic string) int64 {
-	// Dequeue
-	req, _ := http.NewRequest("GET", baseURL+"/dequeue?namespace=e2e&topic="+topic+"&limit=1", nil)
-	req.Header.Set("Authorization", authHeader)
-	resp, err := client.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		t.Fatalf("dequeue failed in leaseAndNack loop: %d", resp.StatusCode)
-	}
-
 	var items []store.Item
-	json.NewDecoder(resp.Body).Decode(&items)
+	for i := 0; i < 20; i++ {
+		req, _ := http.NewRequest("GET", baseURL+"/dequeue?namespace=e2e&topic="+topic+"&limit=1", nil)
+		req.Header.Set("Authorization", authHeader)
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resp.StatusCode != 200 {
+			resp.Body.Close()
+			t.Fatalf("dequeue failed in leaseAndNack loop: %d", resp.StatusCode)
+		}
+		json.NewDecoder(resp.Body).Decode(&items)
+		resp.Body.Close()
+		if len(items) > 0 {
+			break
+		}
+		time.Sleep(150 * time.Millisecond)
+	}
+
 	if len(items) == 0 {
-		t.Fatal("expected item to nack, got none")
+		t.Fatal("expected item to nack, got none after retrying")
 	}
 
 	// Nack
@@ -365,11 +473,14 @@ func leaseAndNack(t *testing.T, client *http.Client, baseURL, authHeader, topic 
 		"error":     "simulated processing failure",
 	}
 	body, _ := json.Marshal(nackPayload)
-	req, _ = http.NewRequest("POST", baseURL+"/nack", bytes.NewReader(body))
+	req, err := http.NewRequest("POST", baseURL+"/nack", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
 	req.Header.Set("Authorization", authHeader)
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err = client.Do(req)
+	resp, err := client.Do(req)
 	if err != nil || resp.StatusCode != 200 {
 		t.Fatalf("nack failed: %v", err)
 	}

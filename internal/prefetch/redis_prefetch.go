@@ -19,7 +19,7 @@ import (
 
 // RedisPrefetcher manages prefetching items from PostgreSQL and caching them in Redis.
 type RedisPrefetcher struct {
-	clients     []*redis.Client
+	clients     []redis.UniversalClient
 	pgStore     *store.PGStore
 	cfg         *config.Config
 	logger      *log.Logger
@@ -30,7 +30,7 @@ type RedisPrefetcher struct {
 }
 
 // NewRedisPrefetcher initializes a new RedisPrefetcher.
-func NewRedisPrefetcher(clients []*redis.Client, pgStore *store.PGStore, cfg *config.Config, logger *log.Logger) *RedisPrefetcher {
+func NewRedisPrefetcher(clients []redis.UniversalClient, pgStore *store.PGStore, cfg *config.Config, logger *log.Logger) *RedisPrefetcher {
 	return &RedisPrefetcher{
 		clients:     clients,
 		pgStore:     pgStore,
@@ -171,7 +171,7 @@ func (h itemHeap) Len() int { return len(h) }
 
 func (h itemHeap) Less(i, j int) bool {
 	if h[i].Priority != h[j].Priority {
-		return h[i].Priority > h[j].Priority
+		return h[i].Priority < h[j].Priority
 	}
 	return h[i].DeliverAfter.Before(h[j].DeliverAfter)
 }

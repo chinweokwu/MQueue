@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 	"database/sql"
+	"strings"
 	_ "github.com/lib/pq"
 
 	"mqueue/internal/buffer"
@@ -19,9 +20,11 @@ import (
 	"mqueue/internal/flusher"
 	"mqueue/internal/log"
 	"mqueue/internal/prefetch"
+	"mqueue/internal/recovery"
 	"mqueue/internal/retry"
 	"mqueue/internal/store"
 	"mqueue/internal/wal"
+	"mqueue/internal/id"
 
 	"github.com/redis/go-redis/v9"
 	"github.com/testcontainers/testcontainers-go"
@@ -103,6 +106,7 @@ func TestStoreIntegration(t *testing.T) {
 
 	redisClient1 := redis.NewClient(&redis.Options{Addr: redisAddr1})
 	redisClient2 := redis.NewClient(&redis.Options{Addr: redisAddr2})
+	redisClient1.FlushDB(ctx)
 
 	// Create WAL directories
 	walDir := t.TempDir() // Use temp dir to avoid cleanup issues
@@ -121,7 +125,7 @@ func TestStoreIntegration(t *testing.T) {
 		WALDir:            walDir,
 	}
 
-	pgStore, err := store.NewPGStore(cfg.DatabaseURLs, []*redis.Client{redisClient1, redisClient2}, cfg)
+	pgStore, err := store.NewPGStore(cfg.DatabaseURLs, []redis.UniversalClient{redisClient1, redisClient2}, cfg)
 	if err != nil {
 		t.Fatalf("failed to initialize store: %s", err)
 	}
@@ -145,9 +149,9 @@ func TestStoreIntegration(t *testing.T) {
 	defer walManager.Close()
 
 	logger := log.NewLogger()
-	redisBuffer := buffer.NewRedisBuffer([]*redis.Client{redisClient1, redisClient2}, cfg, pgStore, logger)
+	redisBuffer := buffer.NewRedisBuffer([]redis.UniversalClient{redisClient1, redisClient2}, cfg, pgStore, logger)
 	_ = retry.NewRetryManager(pgStore, dlqStore, cfg, logger) // Initialize but ignore if unused in specific tests
-	prefetcher := prefetch.NewRedisPrefetcher([]*redis.Client{redisClient1, redisClient2}, pgStore, cfg, logger)
+	prefetcher := prefetch.NewRedisPrefetcher([]redis.UniversalClient{redisClient1, redisClient2}, pgStore, cfg, logger)
 
 	// Start prefetcher in background AFTER schema is ready
 	// go prefetcher.Run(ctx) <- Moved down
@@ -422,6 +426,63 @@ func TestStoreIntegration(t *testing.T) {
 
 
 
+	t.Run("DegradedFallback", func(t *testing.T) {
+		topic := "fallback-topic"
+		namespace := "default"
+
+		primaryShard := pgStore.GetShardID(namespace, topic)
+		pgStore.SetShardHealth(primaryShard, false)
+		defer pgStore.SetShardHealth(primaryShard, true)
+
+		item := store.Item{
+			ID:           999999,
+			Namespace:    namespace,
+			Topic:        topic,
+			Payload:      []byte("fallback-test"),
+			DeliverAfter: time.Now().Add(-1 * time.Minute),
+			Status:       "ready",
+			CreatedAt:    time.Now(),
+			UpdatedAt:    time.Now(),
+		}
+
+		ids, err := pgStore.UpsertItems(ctx, []store.Item{item})
+		if err != nil {
+			t.Fatalf("upsert items failed: %s", err)
+		}
+		if len(ids) == 0 {
+			t.Fatal("expected returned IDs, got none")
+		}
+
+		retrieved, err := pgStore.GetItem(ctx, namespace, topic, item.ID)
+		if err != nil {
+			t.Fatalf("failed to get item: %s", err)
+		}
+		if string(retrieved.Payload) != "fallback-test" {
+			t.Errorf("expected payload 'fallback-test', got '%s'", string(retrieved.Payload))
+		}
+
+		leased, err := pgStore.LeaseItems(ctx, namespace, topic, "fallback-worker", 1, 10*time.Second)
+		if err != nil {
+			t.Fatalf("failed to lease item: %s", err)
+		}
+		if len(leased) == 0 {
+			t.Fatal("expected leased items, got none")
+		}
+		if leased[0].ID != item.ID {
+			t.Errorf("expected leased ID %d, got %d", item.ID, leased[0].ID)
+		}
+
+		err = pgStore.AckItem(ctx, namespace, topic, item.ID)
+		if err != nil {
+			t.Fatalf("failed to ack item: %s", err)
+		}
+
+		_, err = pgStore.GetItem(ctx, namespace, topic, item.ID)
+		if err != sql.ErrNoRows {
+			t.Errorf("expected sql.ErrNoRows, got: %v", err)
+		}
+	})
+
 	t.Run("WALRecovery", func(t *testing.T) {
 		// Enqueue items
 		items := []store.Item{
@@ -435,7 +496,7 @@ func TestStoreIntegration(t *testing.T) {
 		}
 
 		// Re-create store with same WAL
-		newStore, err := store.NewPGStore(cfg.DatabaseURLs, []*redis.Client{redisClient1, redisClient2}, cfg)
+		newStore, err := store.NewPGStore(cfg.DatabaseURLs, []redis.UniversalClient{redisClient1, redisClient2}, cfg)
 		if err != nil {
 			t.Fatalf("failed to recreate store: %s", err)
 		}
@@ -458,4 +519,230 @@ func TestStoreIntegration(t *testing.T) {
 			t.Error("recovered item has wrong payload")
 		}
 	})
+
+	t.Run("NodeIDLeasing", func(t *testing.T) {
+		lm1 := id.NewLeaseManager(redisClient1, "worker-a")
+		lm2 := id.NewLeaseManager(redisClient1, "worker-b")
+		defer lm1.Close()
+		defer lm2.Close()
+
+		// 1. Acquire lease for worker-a
+		nodeID1, err := lm1.Acquire(ctx)
+		if err != nil {
+			t.Fatalf("lm1 acquire failed: %s", err)
+		}
+		if nodeID1 < 0 {
+			t.Errorf("expected valid node ID, got %d", nodeID1)
+		}
+
+		// 2. Try to acquire lease for worker-b
+		nodeID2, err := lm2.Acquire(ctx)
+		if err != nil {
+			t.Fatalf("lm2 acquire failed: %s", err)
+		}
+		if nodeID1 == nodeID2 {
+			t.Errorf("expected different node IDs for different leases, both got %d", nodeID1)
+		}
+
+		// 3. Start renewal for lm1
+		var lostCalled bool
+		var mu sync.Mutex
+		lm1.StartRenewalLoop(ctx, func() {
+			mu.Lock()
+			lostCalled = true
+			mu.Unlock()
+		})
+
+		time.Sleep(1 * time.Second)
+		mu.Lock()
+		lost := lostCalled
+		mu.Unlock()
+		if lost {
+			t.Error("expected lease to remain active, but lost callback was triggered")
+		}
+
+		// 4. Close lm1 (forces release)
+		lm1.Close()
+		time.Sleep(100 * time.Millisecond)
+
+		// 5. Worker-c should succeed
+		lm3 := id.NewLeaseManager(redisClient1, "worker-c")
+		defer lm3.Close()
+		nodeID3, err := lm3.Acquire(ctx)
+		if err != nil {
+			t.Fatalf("lm3 acquire failed: %s", err)
+		}
+		if nodeID3 < 0 {
+			t.Errorf("expected valid node ID for lm3, got %d", nodeID3)
+		}
+	})
+}
+
+func TestEnqueueBackpressure(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	redisAddr, cleanupRedis, err := setupTestRedis(ctx)
+	if err != nil {
+		t.Fatalf("setup redis failed: %s", err)
+	}
+	defer cleanupRedis()
+
+	redisClient := redis.NewClient(&redis.Options{Addr: redisAddr})
+	defer redisClient.Close()
+	redisClient.FlushDB(ctx)
+
+	// Set low limit (MaxBufferLength: 2)
+	cfg := &config.Config{
+		DatabaseURLs:    []string{"postgres://postgres:postgres@localhost:5432/mqueue_test?sslmode=disable"},
+		RedisAddrs:      []string{redisAddr},
+		MaxBufferLength: 2,
+		BufferTTL:       1 * time.Minute,
+		NodeID:          1,
+	}
+
+	pgStore, err := store.NewPGStore(cfg.DatabaseURLs, []redis.UniversalClient{redisClient}, cfg)
+	if err != nil {
+		t.Fatalf("failed to init store: %s", err)
+	}
+	defer func() {
+		for _, db := range pgStore.GetDBs() {
+			db.Close()
+		}
+	}()
+
+	walDir := t.TempDir()
+	walManager, _ := wal.NewWALManager(1, walDir)
+	defer walManager.Close()
+
+	logger := log.NewLogger()
+	redisBuffer := buffer.NewRedisBuffer([]redis.UniversalClient{redisClient}, cfg, pgStore, logger)
+
+	// Enqueue 2 items (limit reached)
+	items := []store.Item{
+		{Namespace: "default", Topic: "backpressure", Priority: 1, Payload: []byte("item1")},
+		{Namespace: "default", Topic: "backpressure", Priority: 1, Payload: []byte("item2")},
+	}
+
+	ids, err := redisBuffer.Enqueue(ctx, items, walManager)
+	if err != nil {
+		t.Fatalf("first enqueue failed: %s", err)
+	}
+	if len(ids) != 2 {
+		t.Errorf("expected 2 IDs, got %d", len(ids))
+	}
+
+	// Enqueue 3rd item (should fail due to backpressure)
+	extraItems := []store.Item{
+		{Namespace: "default", Topic: "backpressure", Priority: 1, Payload: []byte("item3")},
+	}
+	_, err = redisBuffer.Enqueue(ctx, extraItems, walManager)
+	if err == nil {
+		t.Error("expected enqueue to fail due to backpressure limit, but it succeeded")
+	} else if !strings.Contains(err.Error(), "queue buffer full") {
+		t.Errorf("expected 'queue buffer full' error, got: %s", err.Error())
+	}
+}
+
+type ToggleableRedisClient struct {
+	redis.UniversalClient
+	pingError error
+}
+
+func (t *ToggleableRedisClient) Ping(ctx context.Context) *redis.StatusCmd {
+	if t.pingError != nil {
+		cmd := redis.NewStatusCmd(ctx)
+		cmd.SetErr(t.pingError)
+		return cmd
+	}
+	return t.UniversalClient.Ping(ctx)
+}
+
+func TestRecoveryDaemonShardRestore(t *testing.T) {
+	ctx := context.Background()
+	
+	// Setup real Redis
+	redisAddr, cleanupRedis, err := setupTestRedis(ctx)
+	if err != nil {
+		t.Fatalf("setup redis failed: %s", err)
+	}
+	defer cleanupRedis()
+
+	realClient := redis.NewUniversalClient(&redis.UniversalOptions{
+		Addrs: []string{redisAddr},
+	})
+	defer realClient.Close()
+	
+	// Setup PGStore
+	dbURL, cleanupDB, err := setupTestDB(ctx)
+	if err != nil {
+		t.Fatalf("setup db failed: %s", err)
+	}
+	defer cleanupDB()
+
+	pgStore, err := store.NewPGStore([]string{dbURL}, []redis.UniversalClient{realClient}, &config.Config{
+		Namespace: "default",
+	})
+	if err != nil {
+		t.Fatalf("failed to init PGStore: %s", err)
+	}
+
+	// Create toggleable client
+	toggleClient := &ToggleableRedisClient{
+		UniversalClient: realClient,
+	}
+
+	// Setup config, logger, WAL
+	cfg := &config.Config{
+		Namespace: "default",
+		NamespaceQuotas: map[string]int{"default": 1000},
+	}
+	logger := log.NewLogger()
+	walDir := t.TempDir()
+	walManager, _ := wal.NewWALManager(1, walDir)
+	defer walManager.Close()
+
+	// Enqueue items into the WAL
+	redisBuffer := buffer.NewRedisBuffer([]redis.UniversalClient{toggleClient}, cfg, pgStore, logger)
+	items := []store.Item{
+		{Namespace: "default", Topic: "recovery-test", Priority: 1, Payload: []byte("recovery-val"), Status: "ready", DeliverAfter: time.Now(), CreatedAt: time.Now(), UpdatedAt: time.Now()},
+	}
+
+	_, err = redisBuffer.Enqueue(ctx, items, walManager)
+	if err != nil {
+		t.Fatalf("enqueue failed: %s", err)
+	}
+
+	// Instantiate RecoveryDaemon
+	recoveryDaemon := recovery.NewRecoveryDaemon([]redis.UniversalClient{toggleClient}, pgStore, walManager, cfg, logger)
+	recoveryDaemon.Interval = 100 * time.Millisecond
+
+	// 1. Simulate Redis shard going offline
+	toggleClient.pingError = fmt.Errorf("redis connection refused")
+
+	daemonCtx, daemonCancel := context.WithCancel(context.Background())
+	defer daemonCancel()
+	
+	go recoveryDaemon.Run(daemonCtx)
+
+	// Wait for daemon to register offline state
+	time.Sleep(200 * time.Millisecond)
+
+	// 2. Bring Redis shard back online
+	toggleClient.pingError = nil
+
+	// Wait for daemon to detect health recovery, lease lock, and execute WAL replay
+	time.Sleep(500 * time.Millisecond)
+
+	// Verify items are now in PostgreSQL
+	dbItems, err := pgStore.LeaseItems(ctx, "default", "recovery-test", "owner1", 10, 10*time.Second)
+	if err != nil {
+		t.Fatalf("failed to query leased items: %s", err)
+	}
+
+	if len(dbItems) == 0 {
+		t.Error("expected recovered item to be in PostgreSQL, but found none")
+	} else if string(dbItems[0].Payload) != "recovery-val" {
+		t.Errorf("expected payload 'recovery-val', got '%s'", string(dbItems[0].Payload))
+	}
 }

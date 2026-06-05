@@ -1,19 +1,47 @@
 groups:
 - name: mqueue_alerts
   rules:
-  - alert: HighQueueDepth
-    expr: mqueue_queue_depth > 1000
-    for: 5m
-    labels:
-      severity: warning
-    annotations:
-      summary: "High queue depth detected"
-      description: "Queue depth for namespace {{ $labels.namespace }} and topic {{ $labels.topic }} is {{ $value }}, exceeding 1000 for 5 minutes."
   - alert: ShardUnhealthy
     expr: mqueue_shard_health == 0
     for: 1m
     labels:
       severity: critical
     annotations:
-      summary: "Shard unhealthy"
-      description: "Shard {{ $labels.shard }} of type {{ $labels.type }} is unhealthy for 1 minute."
+      summary: "Database/Redis shard is offline"
+      description: "Shard {{ $labels.shard }} of type {{ $labels.type }} is unhealthy/unreachable for more than 1 minute."
+
+  - alert: BackpressureRejectionsActive
+    expr: sum(rate(mqueue_backpressure_rejected_total[1m])) by (namespace, topic) > 0
+    for: 10s
+    labels:
+      severity: critical
+    annotations:
+      summary: "Load shedding active (Backpressure rejects)"
+      description: "MQueue is actively rejecting write requests for namespace {{ $labels.namespace }} and topic {{ $labels.topic }} due to buffer/connection saturation."
+
+  - alert: HighDatabaseFlushLatency
+    expr: histogram_quantile(0.99, sum(rate(mqueue_flush_latency_seconds_bucket[5m])) by (le, namespace, topic)) > 2.0
+    for: 2m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Slow database upserts (Write Amplification)"
+      description: "p99 database write/flush latency for namespace {{ $labels.namespace }} and topic {{ $labels.topic }} is {{ $value }}s, exceeding the 2.0s limit (potential MVCC bloat)."
+
+  - alert: ConsumerStarvation
+    expr: sum(rate(mqueue_enqueue_total[5m])) by (namespace, topic) > 0 and sum(rate(mqueue_dequeue_total[5m])) by (namespace, topic) == 0
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Consumer starvation detected"
+      description: "Messages are actively arriving for namespace {{ $labels.namespace }} and topic {{ $labels.topic }}, but no consumers have dequeued items for the last 5 minutes."
+
+  - alert: HighQueueDepth
+    expr: mqueue_queue_depth > 5000
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "High queue backlog depth"
+      description: "Un-flushed queue depth for namespace {{ $labels.namespace }} and topic {{ $labels.topic }} is {{ $value }}, exceeding the safe buffer limit of 5000."

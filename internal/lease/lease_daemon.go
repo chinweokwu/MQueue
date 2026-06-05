@@ -15,13 +15,13 @@ import (
 )
 
 type LeaseDaemon struct {
-	clients []*redis.Client
+	clients []redis.UniversalClient
 	store   *store.PGStore
 	cfg     *config.Config
 	logger  *log.Logger
 }
 
-func NewLeaseDaemon(clients []*redis.Client, store *store.PGStore, cfg *config.Config, logger *log.Logger) *LeaseDaemon {
+func NewLeaseDaemon(clients []redis.UniversalClient, store *store.PGStore, cfg *config.Config, logger *log.Logger) *LeaseDaemon {
 	return &LeaseDaemon{
 		clients: clients,
 		store:   store,
@@ -82,18 +82,22 @@ func (f *LeaseDaemon) renewLeases(ctx context.Context) error {
 				newExpiresAt := time.Now().Add(f.cfg.LeaseTTL)
 				item.LeaseExpiresAt = &newExpiresAt
 				item.UpdatedAt = time.Now()
-				if _, err := f.store.UpsertItems(ctx, []store.Item{item}); err != nil {
-					f.logger.Error("Failed to renew lease", zap.Error(err), zap.Int64("item_id", item.ID))
-					return fmt.Errorf("renew lease: %w", err)
-				}
 				data, err = json.Marshal(item)
 				if err != nil {
 					f.logger.Error("Failed to marshal item for lease update", zap.Error(err))
 					return fmt.Errorf("marshal item: %w", err)
 				}
-				if err := client.Set(ctx, key, data, f.cfg.LeaseTTL).Err(); err != nil {
-					f.logger.Error("Failed to update lease in Redis", zap.Error(err), zap.String("key", key))
-					return fmt.Errorf("update lease in redis: %w", err)
+
+				pipe := client.Pipeline()
+				// Update lease data key
+				pipe.Set(ctx, key, data, f.cfg.LeaseTTL)
+				// Update lease lock key
+				lockKey := fmt.Sprintf("mqueue:lease_lock:%d", item.ID)
+				pipe.Expire(ctx, lockKey, f.cfg.LeaseTTL)
+
+				if _, err := pipe.Exec(ctx); err != nil {
+					f.logger.Error("Failed to renew lease keys in Redis", zap.Error(err), zap.Int64("item_id", item.ID))
+					return fmt.Errorf("renew lease keys in redis: %w", err)
 				}
 			}
 		}

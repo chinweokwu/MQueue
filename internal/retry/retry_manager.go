@@ -30,6 +30,9 @@ func NewRetryManager(pgStore *store.PGStore, dlqStore *store.DLQStore, cfg *conf
 }
 
 func (r *RetryManager) RetryItem(ctx context.Context, item store.Item, lastError string) error {
+	// Release Redis lease immediately
+	_ = r.pgStore.ReleaseLease(ctx, item.Namespace, item.Topic, item.ID)
+
 	item.Retries++
 	item.LastError = &lastError
 	item.UpdatedAt = time.Now()
