@@ -374,11 +374,68 @@ func ServeDashboard(jwtSecret string) http.HandlerFunc {
             margin-top: 4px;
             text-align: center;
         }
+
+        .dlq-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            background: rgba(248, 113, 113, 0.04);
+            border: 1px solid rgba(248, 113, 113, 0.15);
+            border-radius: 6px;
+            padding: 6px 10px;
+            font-size: 11px;
+            margin-top: 8px;
+        }
+        .dlq-item-text {
+            font-family: 'JetBrains Mono', monospace;
+            color: #f87171;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            max-width: 140px;
+        }
+        .dlq-item-btn {
+            font-size: 10px;
+            background: rgba(52, 211, 153, 0.1);
+            color: var(--neon-green);
+            border: 1px solid rgba(52, 211, 153, 0.2);
+            padding: 2px 6px;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        .nav-tab {
+            text-decoration: none;
+            color: var(--text-mute);
+            font-weight: 600;
+            font-size: 14px;
+            padding: 8px 16px;
+            border-radius: 20px;
+            transition: all 0.2s;
+            border: 1px solid transparent;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .nav-tab:hover {
+            color: var(--text-main);
+            background: rgba(255, 255, 255, 0.05);
+        }
+        .nav-tab.active {
+            color: var(--neon-blue);
+            background: rgba(56, 189, 248, 0.08);
+            border-color: rgba(56, 189, 248, 0.2);
+        }
     </style>
 </head>
 <body>
     <header>
-        <h1>MQUEUE // FINTECH TRANSACTION LEDGER ENGINE</h1>
+        <div style="display: flex; align-items: center; gap: 30px;">
+            <h1>MQUEUE // FINTECH</h1>
+            <nav style="display: flex; gap: 10px;">
+                <a href="/dashboard" class="nav-tab active">💳 Ledger Engine</a>
+                <a href="/dashboard/foqs" class="nav-tab">🎯 FOQS Core</a>
+            </nav>
+        </div>
         <div class="controls-top">
             <button class="btn btn-blue" onclick="produceBatch(false)">💳 Send Money ($50)</button>
             <button class="btn btn-blue" style="background: var(--neon-purple); border-color: var(--neon-purple);" onclick="produceBatch(true)">🚨 Trigger AML Flag ($15K)</button>
@@ -528,6 +585,17 @@ func ServeDashboard(jwtSecret string) http.HandlerFunc {
                     <button class="btn btn-blue" style="justify-content: center;" onclick="produceBatchCore()">➕ Ingest Batch</button>
                     <button class="btn btn-purple" style="justify-content: center;" onclick="consumeBatchCore()">📤 Consume & Ack</button>
                     <button class="btn btn-danger" style="justify-content: center;" id="btnStressCore" onclick="toggleStressCore()">🔥 Stress Test</button>
+                    <button class="btn" style="justify-content: center; background: rgba(251, 191, 36, 0.08); color: var(--neon-yellow); border: 1px solid rgba(251, 191, 36, 0.25);" id="btnChaos" onclick="toggleChaos()">💥 Activate Chaos Mode</button>
+                </div>
+            </div>
+
+            <div class="side-card" style="margin-top: 16px;">
+                <div class="card-title" style="color: var(--neon-red); display: flex; justify-content: space-between; align-items: center;">
+                    <span>💀 Dead Letter Queue (DLQ)</span>
+                    <span id="dlq-count" style="font-family: 'JetBrains Mono', monospace; font-size: 14px; font-weight: 700; background: rgba(248, 113, 113, 0.1); padding: 2px 8px; border-radius: 4px;">0</span>
+                </div>
+                <div id="dlq-container" style="max-height: 150px; overflow-y: auto; margin-top: 12px;">
+                    <div style="color: var(--text-mute); font-size: 11px; text-align: center; padding: 10px 0;">No dead-lettered items.</div>
                 </div>
             </div>
 
@@ -592,6 +660,44 @@ func ServeDashboard(jwtSecret string) http.HandlerFunc {
             terminal.scrollTop = terminal.scrollHeight;
         }
 
+        function triggerWalRecovery(shardID) {
+            const pathRecover0 = document.getElementById("path-wal0-pg" + shardID);
+            const pathRecover1 = document.getElementById("path-wal1-pg" + shardID);
+            const pathRecover2 = document.getElementById("path-wal2-pg" + shardID);
+
+            // Show recovery paths flowing
+            if (counts.wal0 > 0 && shardID === 0) pathRecover0.style.display = "block";
+            if (counts.wal1 > 0) pathRecover1.style.display = "block";
+            if (counts.wal2 > 0 && shardID === 1) pathRecover2.style.display = "block";
+            
+            // Drain WAL into PG Shards
+            setTimeout(function() {
+                for (let p = 0; p < 3; p++) {
+                    const walKey = "wal" + p;
+                    const walCount = counts[walKey];
+                    if (walCount > 0) {
+                        counts["pg" + shardID] += walCount;
+                        counts.walTotal += walCount;
+                        counts[walKey] = 0;
+                        updateDomCounters();
+                        
+                        // Fire particles along recovery path with payload content label
+                        const targetPath = "path-wal" + p + "-pg" + shardID;
+                        for (let i = 0; i < Math.min(walCount, 10); i++) {
+                            setTimeout(function() {
+                                animateParticle(targetPath, "wal", "REPLAY: wal-" + p + ".log");
+                            }, i * 100);
+                        }
+                        
+                        writeLog("SUCCESS: RecoveryDaemon replayed " + walCount + " un-flushed items from rotated WAL logs of Pod mqueue-" + p + " into Postgres Shard " + shardID + ".", "warn");
+                    }
+                }
+                pathRecover0.style.display = "none";
+                pathRecover1.style.display = "none";
+                pathRecover2.style.display = "none";
+            }, 1200);
+        }
+
         function toggleRedisShard(shardID) {
             const key = "redis" + shardID;
             shardHealth[key] = !shardHealth[key];
@@ -600,9 +706,6 @@ func ServeDashboard(jwtSecret string) http.HandlerFunc {
             const path0 = document.getElementById("path-api0-redis" + shardID);
             const path1 = document.getElementById("path-api1-redis" + shardID);
             const path2 = document.getElementById("path-api2-redis" + shardID);
-            const pathRecover0 = document.getElementById("path-wal0-pg" + shardID);
-            const pathRecover1 = document.getElementById("path-wal1-pg" + shardID);
-            const pathRecover2 = document.getElementById("path-wal2-pg" + shardID);
 
             if (!shardHealth[key]) {
                 node.classList.add("unhealthy");
@@ -618,38 +721,7 @@ func ServeDashboard(jwtSecret string) http.HandlerFunc {
                 path1.setAttribute("class", "topo-line normal");
                 path2.setAttribute("class", "topo-line normal");
                 writeLog("INFO: Redis Shard " + shardID + " recovery detected. Starting WAL RecoveryDaemon...", "warn");
-                
-                // Show recovery paths flowing
-                if (counts.wal0 > 0 && shardID === 0) pathRecover0.style.display = "block";
-                if (counts.wal1 > 0) pathRecover1.style.display = "block";
-                if (counts.wal2 > 0 && shardID === 1) pathRecover2.style.display = "block";
-                
-                // Drain WAL into PG Shards
-                setTimeout(function() {
-                    for (let p = 0; p < 3; p++) {
-                        const walKey = "wal" + p;
-                        const walCount = counts[walKey];
-                        if (walCount > 0) {
-                            counts["pg" + shardID] += walCount;
-                            counts.walTotal += walCount;
-                            counts[walKey] = 0;
-                            updateDomCounters();
-                            
-                            // Fire particles along recovery path with payload content label
-                            const targetPath = "path-wal" + p + "-pg" + shardID;
-                            for (let i = 0; i < Math.min(walCount, 10); i++) {
-                                setTimeout(function() {
-                                    animateParticle(targetPath, "wal", "REPLAY: wal-" + p + ".log");
-                                }, i * 100);
-                            }
-                            
-                            writeLog("SUCCESS: RecoveryDaemon replayed " + walCount + " un-flushed items from rotated WAL logs of Pod mqueue-" + p + " into Postgres Shard " + shardID + ".", "warn");
-                        }
-                    }
-                    pathRecover0.style.display = "none";
-                    pathRecover1.style.display = "none";
-                    pathRecover2.style.display = "none";
-                }, 1200);
+                triggerWalRecovery(shardID);
             }
         }
 
@@ -665,6 +737,44 @@ func ServeDashboard(jwtSecret string) http.HandlerFunc {
             document.getElementById("valRejections").innerText = counts.rejections;
             document.getElementById("valProcessed").innerText = counts.processed;
             document.getElementById("valWalTotal").innerText = counts.walTotal;
+        }
+
+        let dlqItemsList = [];
+        function genCID() {
+            return "TX-" + Math.floor(1000 + Math.random() * 9000);
+        }
+
+        function renderDlq() {
+            const container = document.getElementById("dlq-container");
+            const countEl = document.getElementById("dlq-count");
+            countEl.innerText = dlqItemsList.length;
+
+            if (dlqItemsList.length === 0) {
+                container.innerHTML = "<div style=\"color: var(--text-mute); font-size: 11px; text-align: center; padding: 10px 0;\">No dead-lettered items.</div>";
+                return;
+            }
+
+            container.innerHTML = "";
+            dlqItemsList.forEach((item, index) => {
+                const div = document.createElement("div");
+                div.className = "dlq-item";
+                div.innerHTML = "<div class=\"dlq-item-text\" title=\"" + item.payload + "\">[" + item.cid + "] " + item.type + "</div>" +
+                                "<button class=\"dlq-item-btn\" onclick=\"replayDlqItem(" + index + ")\">Replay</button>";
+                container.appendChild(div);
+            });
+        }
+
+        function replayDlqItem(index) {
+            const item = dlqItemsList[index];
+            dlqItemsList.splice(index, 1);
+            renderDlq();
+            writeLog("[" + item.cid + "] DLQ REPLAY: Re-ingesting transaction payload into MQueue...", "warn");
+            
+            if (item.isCore) {
+                produceBatchCore(item.payload, item.cid);
+            } else {
+                produceBatch(item.payload.includes("15000"), item.payload, item.cid);
+            }
         }
 
         function animateParticle(pathId, type, payloadText) {
@@ -714,10 +824,14 @@ func ServeDashboard(jwtSecret string) http.HandlerFunc {
             requestAnimationFrame(step);
         }
 
-        async function produceBatch(isHighValue = false) {
+        async function produceBatch(isHighValue = false, overridePayload = null, overrideCid = null) {
+            const cid = overrideCid || genCID();
             let payload = "";
             let amt = 0;
-            if (isHighValue) {
+            if (overridePayload) {
+                payload = overridePayload;
+                amt = payload.includes("15000") ? 15000 : 50;
+            } else if (isHighValue) {
                 payload = '{"tx_id":"tx_9999","amt":15000,"from":"@mallory","to":"@sybil"}';
                 amt = 15000;
             } else {
@@ -728,7 +842,7 @@ func ServeDashboard(jwtSecret string) http.HandlerFunc {
             }
 
             // 1. Client to K8s
-            animateParticle("path-client-k8s", "enqueue", payload);
+            animateParticle("path-client-k8s", "enqueue", "[" + cid + "] Enqueue");
 
             // 2. K8s Ingress load balancer chooses API server (round-robin style between all 3 pods)
             const targetPod = apiCounter %% 3;
@@ -736,7 +850,7 @@ func ServeDashboard(jwtSecret string) http.HandlerFunc {
             const ingressPath = "path-k8s-api" + targetPod;
             
             setTimeout(function() {
-                animateParticle(ingressPath, "enqueue", payload);
+                animateParticle(ingressPath, "enqueue", "[" + cid + "] Route");
             }, 100);
 
             // 3. API Node decides target Shard using FNV-1a (simulating payload sharding)
@@ -750,27 +864,37 @@ func ServeDashboard(jwtSecret string) http.HandlerFunc {
                 if (writeToRedis) {
                     if (isHighValue) {
                         // High-value transactions trigger Compliance verification queue!
-                        animateParticle(flowPath, "wal", payload);
+                        animateParticle(flowPath, "wal", "[" + cid + "] Hold");
                         counts[redisKey]++;
                         updateDomCounters();
-                        writeLog("AML RULE MATCHED: Transaction " + payload + " exceeds $10k limit. Forwarding to Compliance hold queue.", "warn");
+                        writeLog("[" + cid + "] AML RULE MATCHED: Transaction of $" + amt + " exceeds $10k limit. Forwarding to Compliance hold queue.", "warn");
                         
                         setTimeout(function() {
                             if (counts[redisKey] > 0) {
                                 counts[redisKey]--;
                                 counts.rejections++; // AML Holds
+                                
+                                // Push to DLQ!
+                                dlqItemsList.push({
+                                    cid: cid,
+                                    payload: payload,
+                                    type: "AML Hold ($15K)",
+                                    isCore: false
+                                });
+                                renderDlq();
+                                
                                 updateDomCounters();
-                                writeLog("COMPLIANCE AUDIT: Shard " + targetShard + " flagged transaction tx_9999 as SUSPICIOUS. Debit held.", "error");
+                                writeLog("[" + cid + "] COMPLIANCE AUDIT: Shard " + targetShard + " flagged transaction as SUSPICIOUS. Debit held in DLQ.", "error");
                             }
                         }, 900);
                         return;
                     }
 
                     // Normal Path: Writes to Redis buffer
-                    animateParticle(flowPath, "enqueue", payload);
+                    animateParticle(flowPath, "enqueue", "[" + cid + "] Buffer");
                     counts[redisKey]++;
                     updateDomCounters();
-                    writeLog("Ingested transaction resolved to Shard " + targetShard + ". Buffered in Redis.");
+                    writeLog("[" + cid + "] Ingested transaction resolved to Shard " + targetShard + ". Buffered in Redis.");
 
                     // Background DB flusher drains to PG after 800ms
                     setTimeout(function() {
@@ -778,21 +902,22 @@ func ServeDashboard(jwtSecret string) http.HandlerFunc {
                             counts[redisKey]--;
                             counts["pg" + targetShard]++;
                             updateDomCounters();
-                            animateParticle("path-redis" + targetShard + "-pg" + targetShard, "flush", payload);
-                            writeLog("Flusher: Persisted transaction details to PostgreSQL Shard " + targetShard + " (Reconciling balances).");
+                            animateParticle("path-redis" + targetShard + "-pg" + targetShard, "flush", "[" + cid + "] Flush");
+                            writeLog("[" + cid + "] Flusher: Persisted transaction details to PostgreSQL Shard " + targetShard + " (Reconciling balances).");
                         }
                     }, 900);
                 } else {
                     // Outage path: Redis offline -> Falls back to local WAL storage on that specific pod
                     counts["wal" + targetPod]++;
                     updateDomCounters();
-                    animateParticle(ingressPath, "wal", "WAL: " + payload); // Yellow particle indicates WAL logging
-                    writeLog("WARNING: Redis Shard " + targetShard + " offline! Safely logged transaction to local WAL storage on pod mqueue-" + targetPod + ".", "warn");
+                    animateParticle(ingressPath, "wal", "[" + cid + "] WAL"); // Yellow particle indicates WAL logging
+                    writeLog("[" + cid + "] WARNING: Redis Shard " + targetShard + " offline! Safely logged transaction to local WAL storage on pod mqueue-" + targetPod + ".", "warn");
                 }
             }, 250);
         }
 
         async function consumeBatch() {
+            const cid = genCID();
             // Find a Postgres Shard with items
             let targetShard = -1;
             if (counts.pg0 > 0) targetShard = 0;
@@ -808,8 +933,8 @@ func ServeDashboard(jwtSecret string) http.HandlerFunc {
             updateDomCounters();
             
             // Flow backwards from PG to show dequeue and Ack
-            animateParticle("path-redis" + targetShard + "-pg" + targetShard, "enqueue", "LEDGER POST: TX ACK");
-            writeLog("Ledger Worker: Posted double-entry balances (Debit/Credit) for transaction on Shard " + targetShard + ". Dispatching SMS alert.");
+            animateParticle("path-redis" + targetShard + "-pg" + targetShard, "enqueue", "[" + cid + "] Dequeue");
+            writeLog("[" + cid + "] Ledger Worker: Posted double-entry balances (Debit/Credit) for transaction on Shard " + targetShard + ". Dispatching SMS alert.");
         }
 
         function toggleStress() {
@@ -831,12 +956,12 @@ func ServeDashboard(jwtSecret string) http.HandlerFunc {
             }
         }
 
-        async function produceBatchCore() {
-            // Pick a random payload
-            const payload = samplePayloads[Math.floor(Math.random() * samplePayloads.length)];
+        async function produceBatchCore(overridePayload = null, overrideCid = null) {
+            const cid = overrideCid || genCID();
+            const payload = overridePayload || samplePayloads[Math.floor(Math.random() * samplePayloads.length)];
 
             // 1. Client to K8s
-            animateParticle("path-client-k8s", "enqueue", payload);
+            animateParticle("path-client-k8s", "enqueue", "[" + cid + "] Enqueue");
 
             // 2. K8s Ingress load balancer chooses API server (round-robin style between all 3 pods)
             const targetPod = apiCounter %% 3;
@@ -844,7 +969,7 @@ func ServeDashboard(jwtSecret string) http.HandlerFunc {
             const ingressPath = "path-k8s-api" + targetPod;
             
             setTimeout(function() {
-                animateParticle(ingressPath, "enqueue", payload);
+                animateParticle(ingressPath, "enqueue", "[" + cid + "] Route");
             }, 100);
 
             // 3. API Node decides target Shard using FNV-1a (simulating payload sharding)
@@ -857,10 +982,10 @@ func ServeDashboard(jwtSecret string) http.HandlerFunc {
                 
                 if (writeToRedis) {
                     // Normal Path: Writes to Redis buffer
-                    animateParticle(flowPath, "enqueue", payload);
+                    animateParticle(flowPath, "enqueue", "[" + cid + "] Buffer");
                     counts[redisKey]++;
                     updateDomCounters();
-                    writeLog("Ingested payload resolved to Shard " + targetShard + ". Buffered in memory.");
+                    writeLog("[" + cid + "] Ingested payload resolved to Shard " + targetShard + ". Buffered in memory.");
 
                     // Background DB flusher drains to PG after 800ms
                     setTimeout(function() {
@@ -868,21 +993,22 @@ func ServeDashboard(jwtSecret string) http.HandlerFunc {
                             counts[redisKey]--;
                             counts["pg" + targetShard]++;
                             updateDomCounters();
-                            animateParticle("path-redis" + targetShard + "-pg" + targetShard, "flush", payload);
-                            writeLog("Flusher: Persisted buffered items to PostgreSQL Shard " + targetShard + ".");
+                            animateParticle("path-redis" + targetShard + "-pg" + targetShard, "flush", "[" + cid + "] Flush");
+                            writeLog("[" + cid + "] Flusher: Persisted buffered items to PostgreSQL Shard " + targetShard + ".");
                         }
                     }, 900);
                 } else {
                     // Outage path: Redis offline -> Falls back to local WAL storage on that specific pod
                     counts["wal" + targetPod]++;
                     updateDomCounters();
-                    animateParticle(ingressPath, "wal", "WAL: " + payload); // Yellow particle indicates WAL logging
-                    writeLog("WARNING: Redis Shard " + targetShard + " is offline! Logged batch safely to local WAL storage on pod mqueue-" + targetPod + ".", "warn");
+                    animateParticle(ingressPath, "wal", "[" + cid + "] WAL"); // Yellow particle indicates WAL logging
+                    writeLog("[" + cid + "] WARNING: Redis Shard " + targetShard + " is offline! Logged batch safely to local WAL storage on pod mqueue-" + targetPod + ".", "warn");
                 }
             }, 250);
         }
 
         async function consumeBatchCore() {
+            const cid = genCID();
             // Find a Postgres Shard with items
             let targetShard = -1;
             if (counts.pg0 > 0) targetShard = 0;
@@ -898,8 +1024,8 @@ func ServeDashboard(jwtSecret string) http.HandlerFunc {
             updateDomCounters();
             
             // Flow backwards from PG to show dequeue and Ack
-            animateParticle("path-redis" + targetShard + "-pg" + targetShard, "enqueue", "ACK: ID " + Math.floor(Math.random() * 10000));
-            writeLog("Consumer: Dequeued job from PG Shard " + targetShard + ". Ack sent successfully.");
+            animateParticle("path-redis" + targetShard + "-pg" + targetShard, "enqueue", "[" + cid + "] Dequeue");
+            writeLog("[" + cid + "] Consumer: Dequeued job from PG Shard " + targetShard + ". Ack sent successfully.");
         }
 
         let stressActiveCore = false;
@@ -920,6 +1046,77 @@ func ServeDashboard(jwtSecret string) http.HandlerFunc {
                 btn.innerText = "🔥 Stress Test";
                 clearInterval(stressIntervalCore);
                 writeLog("STRESS CONCLUDED: Traffic returned to normal.");
+            }
+        }
+
+        let chaosActive = false;
+        let chaosInterval = null;
+        function toggleChaos() {
+            chaosActive = !chaosActive;
+            const btn = document.getElementById("btnChaos");
+            if (chaosActive) {
+                btn.style.background = "rgba(239, 68, 68, 0.2)";
+                btn.style.color = "var(--neon-red)";
+                btn.style.borderColor = "var(--neon-red)";
+                btn.innerText = "🛑 Stop Chaos Mode";
+                writeLog("SYSTEM: Chaos Engineering active. Simulating network splits...", "warn");
+
+                chaosInterval = setInterval(function() {
+                    const cid = "CHAOS-" + Math.floor(1000 + Math.random() * 9000);
+                    const shardToFail = Math.random() < 0.5 ? 0 : 1;
+                    const key = "redis" + shardToFail;
+                    
+                    // Toggle shard health
+                    shardHealth[key] = !shardHealth[key];
+                    
+                    const node = document.getElementById("node-" + key);
+                    const path0 = document.getElementById("path-api0-" + key);
+                    const path1 = document.getElementById("path-api1-" + key);
+                    const path2 = document.getElementById("path-api2-" + key);
+
+                    if (!shardHealth[key]) {
+                        node.classList.add("unhealthy");
+                        node.querySelector(".outage-switch").innerText = "Outage Simulated";
+                        path0.setAttribute("class", "topo-line unhealthy");
+                        path1.setAttribute("class", "topo-line unhealthy");
+                        path2.setAttribute("class", "topo-line unhealthy");
+                        writeLog("[" + cid + "] CHAOS: Redis Shard " + shardToFail + " network split detected! Shard offline.", "error");
+                    } else {
+                        node.classList.remove("unhealthy");
+                        node.querySelector(".outage-switch").innerText = "Click to Fail";
+                        path0.setAttribute("class", "topo-line normal");
+                        path1.setAttribute("class", "topo-line normal");
+                        path2.setAttribute("class", "topo-line normal");
+                        writeLog("[" + cid + "] CHAOS: Redis Shard " + shardToFail + " connection recovered.", "warn");
+                        triggerWalRecovery(shardToFail);
+                    }
+                }, 3500);
+            } else {
+                btn.style.background = "rgba(251, 191, 36, 0.08)";
+                btn.style.color = "var(--neon-yellow)";
+                btn.style.borderColor = "rgba(251, 191, 36, 0.25)";
+                btn.innerText = "💥 Activate Chaos Mode";
+                clearInterval(chaosInterval);
+                writeLog("SYSTEM: Chaos Mode disabled. Network topology stabilized.");
+                
+                // Restore all shards
+                for (let i = 0; i < 2; i++) {
+                    const key = "redis" + i;
+                    if (!shardHealth[key]) {
+                        shardHealth[key] = true;
+                        const node = document.getElementById("node-" + key);
+                        const path0 = document.getElementById("path-api0-" + key);
+                        const path1 = document.getElementById("path-api1-" + key);
+                        const path2 = document.getElementById("path-api2-" + key);
+
+                        node.classList.remove("unhealthy");
+                        node.querySelector(".outage-switch").innerText = "Click to Fail";
+                        path0.setAttribute("class", "topo-line normal");
+                        path1.setAttribute("class", "topo-line normal");
+                        path2.setAttribute("class", "topo-line normal");
+                        triggerWalRecovery(i);
+                    }
+                }
             }
         }
 

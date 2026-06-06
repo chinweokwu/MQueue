@@ -45,7 +45,7 @@ spec:
       terminationGracePeriodSeconds: 30
       containers:
       - name: mqueue
-        image: mqueue:v6
+        image: mqueue:v8
         imagePullPolicy: IfNotPresent
         ports:
         - containerPort: 8080

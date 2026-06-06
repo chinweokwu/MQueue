@@ -49,6 +49,7 @@ func SetupRouter(r *chi.Mux, cfg *config.Config, pgStore *store.PGStore, dlqStor
 		w.Write([]byte("OK"))
 	})
 	r.Get("/dashboard", ServeDashboard(cfg.JWTSecret))
+	r.Get("/dashboard/foqs", ServeFOQSDashboard(cfg.JWTSecret))
 
 	r.Group(func(r chi.Router) {
 		r.Use(authMiddleware(cfg.JWTSecret, logger))
