@@ -81,6 +81,8 @@ func setupTestRedis(ctx context.Context) (string, func(), error) {
 
 func TestStoreIntegration(t *testing.T) {
 	ctx := context.Background()
+	daemonsCtx, cancelDaemons := context.WithCancel(ctx)
+	var daemonsWg sync.WaitGroup
 
 	// Setup DB (Sharded 1 & 2 reuse same DB for Docker test)
 	dbURL, cleanupDB, err := setupTestDB(ctx)
@@ -135,6 +137,10 @@ func TestStoreIntegration(t *testing.T) {
 		}
 		redisClient1.Close()
 		redisClient2.Close()
+	}()
+	defer func() {
+		cancelDaemons()
+		daemonsWg.Wait()
 	}()
 
 	dlqStore, err := store.NewDLQStore(cfg.DatabaseURLs, cfg)
@@ -203,7 +209,11 @@ func TestStoreIntegration(t *testing.T) {
 		}
 
 	flusher := flusher.NewFlusher(redisBuffer, pgStore, cfg, logger)
-	go flusher.Run(ctx)
+	daemonsWg.Add(1)
+	go func() {
+		defer daemonsWg.Done()
+		flusher.Run(daemonsCtx)
+	}()
 	// Prefetcher started later for relevant tests
 	}
 
@@ -358,7 +368,11 @@ func TestStoreIntegration(t *testing.T) {
 	})
 
 	// Start Prefetcher for Redis-integrated tests
-	go prefetcher.Run(ctx)
+	daemonsWg.Add(1)
+	go func() {
+		defer daemonsWg.Done()
+		prefetcher.Run(daemonsCtx)
+	}()
 	time.Sleep(2 * time.Second) // Allow prefetcher to initialize
 
 	t.Run("RedisReadyQueueServing", func(t *testing.T) {

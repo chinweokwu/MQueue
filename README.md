@@ -1,172 +1,288 @@
 # MQueue (Distributed, Sharded, Priority Message Queue)
 
-**mqueue** is a high-performance, distributed, sharded priority message queue written in **Go**. It is designed for **massive write throughput**, **strict priority ordering**, and **at-least-once delivery**.
+**mqueue** is a high-performance, distributed, sharded priority message queue written in **Go**. Modeled after **Facebook's FOQS** (Facebook Ordered Queueing Service), it is built to support massive write throughput, strict priority scheduling, and at-least-once delivery.
 
-mqueue is modeled after **Facebook's FOQS** (Facebook Ordered Queueing Service). It combines the durability of **PostgreSQL** with the speed of **Redis** and the safety of a **Write-Ahead Log (WAL)**.
-
----
-
-## 🚀 Key Features
-
-### ⚡ Async Enqueue & High Throughput
-- **Non-Blocking Writes**: Enqueue requests are written to Redis (buffer) and WAL (durability) and acknowledged *immediately*.
-- **Snowflake IDs**: Generates unique, time-ordered 64-bit IDs application-side, avoiding database round-trips for ID generation.
-- **Bulk Flushing**: Background flushers batch-insert items into PostgreSQL, maximizing database throughput.
-
-### 🛡️ Reliability & Durability
-- **WAL-Based Recovery**: Every message is persisted to a local Write-Ahead Log before ack. If the server crashes, items are recovered on startup.
-- **Graceful Shutdown**: Ensures all in-flight memory buffers are drained to the database before the application exits.
-- **Circuit Breakers**: Automatically stops writing to a database shard if it becomes unhealthy, preventing cascading failures.
-- **Strict Sharding**: Routes writes based on `(namespace, topic)` hash. Fails fast if the target shard is unavailable to prevent data inconsistency.
-
-### 🎯 Priority & Scheduling
-- **Priority Queues**: Items are ordered by `priority` (asc) and then `deliver_after` timestamp.
-- **Delayed Delivery**: Native support for scheduling tasks in the future.
-- **Prefetching**: Background prefetchers move high-priority items from disk (Postgres) to memory (Redis) to ensure low-latency dequeue.
-
-### 📦 Multi-Tenancy
-- **Namespaces**: Logical isolation for different teams or customers.
-- **Quotas**: Configurable rate limits (enqueues/minute) per namespace.
-- **Dynamic Topics**: Topics are created on-the-fly; no manual provisioning required.
-
-### 🔍 Observability
-- **Structured Logging**: Configurable JSON/Console logging via Zap.
-- **Prometheus Metrics**: Built-in `/metrics` endpoint with counters for enqueue, dequeue, ack, nack, and queue depth.
-- **Tracing Context**: Ready for OpenTelemetry integration.
+It combines the speed of **Redis** for fast-path enqueueing and prefetch dequeueing with the durability of **PostgreSQL** for persistence, wrapped in a local **Write-Ahead Log (WAL)** for crash recovery.
 
 ---
 
-## Architecture
-![Process Architecture](assets/architecture_diagram.png)
-
-### How It Works
-1.  **Enqueue (Write Fast)**: Requests are immediately written to a **Redis Buffer** and a local **WAL** (Write-Ahead Log) for durability. The client receives an ID immediately, without waiting for a database transaction.
-2.  **Persist (Flush)**: Background flushers drain the Redis buffer and performs efficient **Bulk Inserts** into the appropriate **PostgreSQL Shard**.
-3.  **Prepare (Prefetch)**: Background prefetchers scan the database for high-priority, ready-to-process items and push them into a **Redis Ready Queue**.
-4.  **Dequeue (Read Fast)**: Consumers read directly from the **Redis Ready Queue** (FIFO), ensuring sub-millisecond latency.
-5.  **Clean Up (Ack)**: When a consumer finishes a job, it sends an ACK, which deletes the record from PostgreSQL.
+## 📖 Table of Contents
+1. [Core Mechanics (How It Works)](#-core-mechanics-how-it-works)
+2. [Dashboard & Telemetry](#-dashboard--telemetry)
+3. [Performance & Benchmark Capacity](#-performance--benchmark-capacity)
+4. [Quick Start (How to Run)](#-quick-start-how-to-run)
+5. [Connecting to Microservices (API & Integration)](#-connecting-to-microservices-api--integration)
+6. [Configuration Schema](#-configuration-schema)
 
 ---
 
-## 🛠️ Configuration
+## 🎯 Core Mechanics (How It Works)
 
-Configuration is loaded from `.env` or environment variables.
+MQueue splits its operations into decoupled write, persistence, and read pipelines:
 
-| Variable | Description | Default |
-| :--- | :--- | :--- |
-| `DATABASE_URLS` | Comma-separated Postgres connection strings (Shards) | **Required** |
-| `REDIS_ADDRS` | Comma-separated Redis addresses | **Required** |
-| `REDIS_PASSWORD`| Redis password | `""` |
-| `WAL_DIR` | Directory for Write-Ahead Log files | **Required** |
-| `MQUEUE_NODE_ID`| Unique integer ID (0-1023) for Snowflake generator | `1` |
-| `LOG_LEVEL` | `debug`, `info`, `warn`, `error` | `info` |
-| `LOG_ENCODING` | `json` (prod), `console` (dev) | `json` |
-| `JWT_SECRET` | Secret for verifying auth tokens | **Required** |
-| `NAMESPACE_QUOTAS`| Rate limits (e.g. `tenant-a:1000,tenant-b:500`) | `""` |
-| `BUFFER_TTL` | Time to keep items in Redis Buffer (e.g. `1m`, `1h`) | `1m` |
+![MQueue Architecture Diagram](./assets/architecture_diagram.png)
+
+1. **Enqueue (Write Fast)**:
+   Producers call `/enqueue`. The server generates globally unique, time-ordered 64-bit **Snowflake IDs** application-side (no database round-trip). It then writes the messages to an in-memory **Redis Buffer** list and appends them to a local **Write-Ahead Log (WAL)** file. Once safely written to WAL, the request is immediately acknowledged (latency is sub-millisecond).
+2. **Flush (Durable Persistence)**:
+   A background **Flusher** daemon periodically drains the Redis Buffer and executes high-speed **Bulk Inserts** into PostgreSQL shards, sharding data based on a hash of the `(namespace + topic)`.
+3. **Prefetch (Read Smart)**:
+   To avoid executing expensive sorting queries on PostgreSQL database shards for every read request, a background **Prefetcher** daemon polls PostgreSQL for upcoming, ready tasks. It locks/leases these items and pre-loads them into the **Redis Ready Queue**.
+4. **Dequeue (Memory Speed)**:
+   Consumers call `/dequeue`. They pull directly from the in-memory **Redis Ready Queue** using `LPOP`, achieving sub-millisecond dequeue speeds. If the Redis queue is empty, the server automatically falls back to leasing directly from PostgreSQL (slow-path).
+5. **Acknowledge (Lifecycle End)**:
+   Once the task is finished, the worker sends a `POST /ack` request, deleting the item from the PostgreSQL database shard. If the job fails, `POST /nack` puts the item back in the Postgres retry loop with exponential backoff.
 
 ---
 
-## 🏃 Quick Start
+## 📊 Dashboard & Telemetry
 
-### 1. Run with Docker Compose
+MQueue includes built-in interactive HTML5 dashboards for real-time visualization of queue metrics, distributed shard state, and background daemon cycles. These dashboards allow operators to inspect system health, verify data routing, and even interactively simulate cluster failovers.
+
+### 💳 Ledger Engine Cluster Dashboard
+**Access Endpoint**: `/dashboard` (or the default root `/`)
+
+The Ledger Engine Dashboard provides a high-level view of the entire cluster's health and throughput. It maps client requests flowing through the system's load balancers down to individual Redis buffers and PostgreSQL sharded databases.
+
+* **Key Features**:
+  * **Dynamic Flow Pipeline**: Animates task ingestion from the client, fast-path writes to Redis memory buffers, and database flusher sweeps to Postgres.
+  * **Live Shard Clusters**: Displays connection pool saturation, WAL replays, and successful/rejected transaction rates in real time.
+  * **Interactive Outage Simulation**: Operators can click on any individual **Redis Shard** to trigger an artificial outage. The pipeline path automatically adapts, showing data logging on local worker WAL disks instead of Redis. When the shard is clicked again, it triggers the background `RecoveryDaemon` to replay WAL logs and restore shard health.
+  * **Log Terminal**: Stream real-time cluster operations and heartbeat events.
+
+![MQueue Shard Cluster Dashboard](./assets/dashboard_status.png)
+
+*The status dashboard showing normal distributed write operations under stress testing.*
+
+---
+
+### 🎯 FOQS Core Scheduling Engine Dashboard
+**Access Endpoint**: `/dashboard/foqs`
+
+The FOQS Core Dashboard focuses on the task scheduler's core queuing algorithms, demonstrating exactly how priority scheduling, delayed delivery, and background prefetcher loops function.
+
+* **Key Features**:
+  * **Visual Prefetcher Loop**: View how the prefetcher pulls upcoming tasks from sharded PostgreSQL databases and loads them into memory-speed Redis ready queues.
+  * **Interactive Scheduling Actions**: Users can trigger money transfers ($50) or suspicious AML transfers ($15K) to visually trace priority execution, or schedule items with delivery delays to watch them wait until their delivery timestamp is reached.
+  * **Dead Letter Queue (DLQ) Integration**: Visually monitor tasks that have failed processing multiple times. Users can inspect the exact payload in the DLQ box and manually trigger a re-ingestion retry.
+
+![FOQS Core Scheduling Engine Dashboard](./assets/dashboard_foqs.png)
+
+*The FOQS scheduling visualizer showing priority-based queues and DLQ replay controls.*
+
+---
+
+## ⚡ Performance & Benchmark Capacity
+
+MQueue was benchmarked on a standard local containerized development environment (concurrency level of 50, 1 database shard, 1 Redis instance) using the built-in benchmark utility.
+
+### Measured Throughput Metrics:
+* **Enqueue (Redis buffer + WAL disk write)**: **~150+ operations/sec** (includes writing and fsyncing to the Write-Ahead Log).
+* **Database Flush (Persistence to PostgreSQL)**: **~2,900+ operations/sec** (leveraging batch bulk inserts).
+* **Dequeue (Prefetched Redis Read)**: **~87,000+ operations/sec** (pure memory speed).
+
+> [!NOTE]
+> In production environments with multiple PostgreSQL shards and SSD-backed WAL storage, enqueue throughput scales horizontally and matches Redis limits.
+
+### Running the Benchmarks
+To run the benchmark utility on your local setup:
 ```bash
-docker-compose up --build -d
+make benchmark
+```
+*(This starts a test PostgreSQL and Redis container via Docker Compose, creates temporary folders, and runs the Go benchmark suite).*
+
+---
+
+## 🏃 Quick Start (How to Run)
+
+### Requirements
+* **Go** 1.22 or higher (if running outside Docker)
+* **Docker & Docker Compose** (recommended)
+
+### Option A: Run via Docker Compose (Recommended)
+
+> [!NOTE]
+> Local development and testing run entirely inside standard **Docker Containers** using Docker Compose. **Kubernetes (K8s) is NOT required to run MQueue locally.** 
+> The "Pods" displayed on the dashboard are simply the 3 local Docker container replicas managed by Docker Compose.
+
+1. **Start the services**:
+   ```bash
+   docker-compose up --build -d
+   ```
+   This spins up:
+   * 3 API load-balanced replicas of the Go MQueue service (mapped as Pods `mqueue-0`, `mqueue-1`, and `mqueue-2` on the dashboard)
+   * PostgreSQL instances configured as database shards
+   * Redis instances configured for rate-limiting, buffers, and prefetch queues
+
+2. **Verify Server Health**:
+   ```bash
+   curl -k https://localhost:8080/health
+   # Expected Output: OK
+   ```
+
+3. **Run the integration test suite**:
+   ```bash
+   make docker-test
+   ```
+
+### Option B: Run Locally (Bare Metal)
+1. **Provision Dependencies**:
+   Ensure PostgreSQL (shards) and Redis are running.
+2. **Apply Database Schema**:
+   Import `create_tables.sql` into your Postgres databases.
+3. **Configure Environment Variables**:
+   Create a `.env` file based on the config section below.
+4. **Setup WAL folders**:
+   ```bash
+   make setup-wal
+   ```
+5. **Run the application**:
+   ```bash
+   go run main.go
+   ```
+
+---
+
+## 🔌 Connecting to Microservices (API & Integration)
+
+Microservices communicate with MQueue over HTTP/HTTPS. All endpoints (except `/health` and visual dashboards) require a valid **JSON Web Token (JWT)** in the authorization header.
+
+### 🔑 Authentication & Scopes
+MQueue uses HMAC-SHA256 tokens signed with `JWT_SECRET`. To connect, your microservice must provide the header:
+```http
+Authorization: Bearer <JWT_TOKEN>
 ```
 
-### 2. Run Integration Tests (Dockerized)
-Run the full integration suite in a clean, isolated environment:
-```bash
-make docker-test
-```
+Your JWT token claims must grant permission to your target namespace. The token must contain either:
+1. A **`scopes`** array mapping `namespace:action` (actions: `read`, `write`, or `*`):
+   ```json
+   {
+     "sub": "microservice-payments",
+     "scopes": ["payments:write", "payments:read"]
+   }
+   ```
+2. Or an **`allowed_namespaces`** claim:
+   ```json
+   {
+     "allowed_namespaces": ["payments", "auth"]
+   }
+   ```
 
-### 3. Verify Health
-```bash
-curl -k https://localhost:8080/health
-# Output: OK
-```
+---
 
-### 3. Enqueue a Message
+### 📥 Enqueueing Messages (Write Path)
+**Endpoint**: `POST /enqueue`
+
+Send a JSON array containing the tasks to enqueue. 
+
 ```bash
 curl -k -X POST https://localhost:8080/enqueue \
   -H "Authorization: Bearer <YOUR_JWT>" \
   -H "Content-Type: application/json" \
   -d '[{
-    "namespace": "default",
-    "topic": "test-topic",
+    "namespace": "payments",
+    "topic": "process-refund",
     "priority": 1,
-    "payload": "SGVsbG8gV29ybGQ=", 
-    "deliver_after": "2024-01-01T12:00:00Z"
+    "payload": "eyJrZXkiOiAidmFsdWUiLCJhbW91bnQiOiAxMC41MH0=", 
+    "deliver_after": "2026-06-06T12:00:00Z"
   }]'
 ```
+* **`payload`**: Must be a **Base64 encoded** string.
+* **`priority`**: Integer priority weight. **Lower numbers are processed first** (0 is highest priority).
+* **`deliver_after`**: UTC timestamp. The task remains hidden in the queue until this time is reached (for delayed scheduling).
 
-### 4. Dequeue a Message
+**Response** (HTTP 200):
+```json
+[269543218222202880]
+```
+Returns a list of generated Snowflake IDs corresponding to your batch.
+
+---
+
+### 📤 Dequeueing Messages (Read Path)
+**Endpoint**: `GET /dequeue`
+
+Microservice workers poll this endpoint to receive pending messages.
+
 ```bash
-curl -k "https://localhost:8080/dequeue?namespace=default&topic=test-topic&limit=1" \
+curl -k "https://localhost:8080/dequeue?namespace=payments&topic=process-refund&limit=5" \
   -H "Authorization: Bearer <YOUR_JWT>"
 ```
+* **`namespace`**: Isolating tenant workspace (required).
+* **`topic`**: Task queue identifier (required).
+* **`limit`**: Maximum number of items to return in the batch (defaults to 10).
 
-### 5. Acknowledge (ACK)
-```bash
-curl -k -X POST https://localhost:8080/ack \
-  -H "Authorization: Bearer <YOUR_JWT>" \
-  -d '{
-    "id": 174568912344,
-    "namespace": "default",
-    "topic": "test-topic"
-  }'
-```
-
-### 6. Go Client Example
-You can easily integrate MQueue into your Go application:
-
-```go
-package main
-
-import (
-	"bytes"
-	"encoding/json"
-	"fmt"
-	"net/http"
-	"time"
-)
-
-type Item struct {
-	Namespace    string    `json:"namespace"`
-	Topic        string    `json:"topic"`
-	Priority     int       `json:"priority"`
-	Payload      []byte    `json:"payload"`
-	DeliverAfter time.Time `json:"deliver_after"`
-}
-
-func main() {
-	// Enqueue
-	item := Item{
-		Namespace:    "default",
-		Topic:        "orders",
-		Priority:     1,
-		Payload:      []byte("order-123"),
-		DeliverAfter: time.Now(),
-	}
-	body, _ := json.Marshal([]Item{item})
-	req, _ := http.NewRequest("POST", "http://localhost:8080/enqueue", bytes.NewBuffer(body))
-	req.Header.Set("Authorization", "Bearer <JWT>")
-	req.Header.Set("Content-Type", "application/json")
-	
-	resp, _ := http.DefaultClient.Do(req)
-	defer resp.Body.Close()
-	fmt.Println("Enqueued:", resp.Status)
-}
+**Response** (HTTP 200):
+```json
+[
+  {
+    "id": 269543218222202880,
+    "namespace": "payments",
+    "topic": "process-refund",
+    "payload": "eyJrZXkiOiAidmFsdWUiLCJhbW91bnQiOiAxMC41MH0=",
+    "priority": 1,
+    "deliver_after": "2026-06-06T12:00:00Z",
+    "lease_expires_at": "2026-06-06T12:30:00Z"
+  }
+]
 ```
 
 ---
 
-## ⚠️ "Production Ready" Notes
+### ✅ Acknowledging Messages (Completion)
+**Endpoint**: `POST /ack`
 
-*   **Sharding**: MQueue uses `hash(namespace + topic)` to pick a shard. This allows high throughput but means a single topic cannot exceed the write capacity of one Postgres instance.
-*   **Failover**: If a shard goes down, writes to topics on that shard will **fail** (return 500) to preserve data consistency. We do not support "spillover" writes to avoid orphaned data.
-*   **WAL**: Ensure `WAL_DIR` is mounted on a persistent volume in production.
+Once a microservice worker successfully processes a message, it must acknowledge it to remove it from the system. If it is not acknowledged before `lease_expires_at`, it will be redelivered.
 
-## License
+```bash
+curl -k -X POST https://localhost:8080/ack \
+  -H "Authorization: Bearer <YOUR_JWT>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "id": 269543218222202880,
+    "namespace": "payments",
+    "topic": "process-refund"
+  }'
+```
 
-MIT License
+**Response**: HTTP 200 `OK`.
+
+---
+
+### ❌ Negative Acknowledging (Failure / Retry)
+**Endpoint**: `POST /nack`
+
+If a microservice fails to process a message, it should notify the queue. MQueue will re-schedule the task with exponential backoff.
+
+```bash
+curl -k -X POST https://localhost:8080/nack \
+  -H "Authorization: Bearer <YOUR_JWT>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "id": 269543218222202880,
+    "namespace": "payments",
+    "topic": "process-refund",
+    "error": "Payment service connection timeout"
+  }'
+```
+
+**Response**: HTTP 200 `OK`.
+
+---
+
+## 🛠️ Configuration Schema
+
+Configuration is loaded from environment variables or a `.env` file:
+
+| Variable | Description | Example / Default |
+| :--- | :--- | :--- |
+| `DATABASE_URLS` | Comma-separated Postgres shard connections | `postgres://user:pass@host:5432/mqueue?sslmode=disable` |
+| `REDIS_ADDRS` | Comma-separated Redis addresses | `localhost:6379,localhost:6380` |
+| `REDIS_PASSWORD`| Redis password | `""` |
+| `WAL_DIR` | Directory path for Write-Ahead Log files | `./wal` |
+| `MQUEUE_NODE_ID`| Snowflake generator Worker Node ID (0-1023) | `1` |
+| `LOG_LEVEL` | Logging level (`debug`, `info`, `warn`, `error`) | `info` |
+| `LOG_ENCODING` | Output format (`json` or `console`) | `json` |
+| `JWT_SECRET` | Secret key used to sign and verify auth tokens | **Required** |
+| `NAMESPACE_QUOTAS`| Rate limits per namespace (enqueues/minute) | `default:10000,payments:5000` |
+| `BUFFER_TTL` | Time to live for data in Redis Buffer | `1m` |

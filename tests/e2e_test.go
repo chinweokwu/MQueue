@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -148,6 +149,12 @@ func TestE2E_HTTP_Flow(t *testing.T) {
 		t.Fatalf("failed to create schema: %v", err)
 	}
 
+	// Clean database before starting E2E test to prevent interference from other tests
+	_, err = db.Exec("TRUNCATE TABLE items, dead_letter CASCADE")
+	if err != nil {
+		t.Fatalf("failed to truncate tables: %v", err)
+	}
+
 	// Components
 	walManager, _ := wal.NewWALManager(1, walDir)
 	defer walManager.Close()
@@ -156,14 +163,26 @@ func TestE2E_HTTP_Flow(t *testing.T) {
 	redisBuffer := buffer.NewRedisBuffer([]redis.UniversalClient{redisClient}, cfg, pgStore, logger)
 	retryManager := retry.NewRetryManager(pgStore, dlqStore, cfg, logger)
 
-	// Start Daemons (Prefetcher is critical for Dequeue to work from Redis)
+	// Start Daemons with sync.WaitGroup to avoid race condition during teardown
 	prefetcher := prefetch.NewRedisPrefetcher([]redis.UniversalClient{redisClient}, pgStore, cfg, logger)
 	flusher := flusher.NewFlusher(redisBuffer, pgStore, cfg, logger)
 
+	var wg sync.WaitGroup
 	ctxDaemons, cancelDaemons := context.WithCancel(ctx)
-	defer cancelDaemons()
-	go prefetcher.Run(ctxDaemons)
-	go flusher.Run(ctxDaemons)
+	defer func() {
+		cancelDaemons()
+		wg.Wait()
+	}()
+
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		prefetcher.Run(ctxDaemons)
+	}()
+	go func() {
+		defer wg.Done()
+		flusher.Run(ctxDaemons)
+	}()
 
 	// 3. Start HTTP Server
 	// -------------------------------------------------------------------------
