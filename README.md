@@ -13,6 +13,8 @@ It combines the speed of **Redis** for fast-path enqueueing and prefetch dequeue
 4. [Quick Start (How to Run)](#-quick-start-how-to-run)
 5. [Connecting to Microservices (API & Integration)](#-connecting-to-microservices-api--integration)
 6. [Configuration Schema](#-configuration-schema)
+7. [Design Decisions & Roadmap](#-design-decisions--roadmap)
+8. [Documentation Guides](#-documentation-guides)
 
 ---
 
@@ -286,3 +288,14 @@ Configuration is loaded from environment variables or a `.env` file:
 | `JWT_SECRET` | Secret key used to sign and verify auth tokens | **Required** |
 | `NAMESPACE_QUOTAS`| Rate limits per namespace (enqueues/minute) | `default:10000,payments:5000` |
 | `BUFFER_TTL` | Time to live for data in Redis Buffer | `1m` |
+
+---
+
+## 📚 Documentation Guides
+
+For specific implementation patterns and cluster operations, refer to the following documents:
+* [DETAILED_ARCHITECTURE.md](./DETAILED_ARCHITECTURE.md) - Deep-dive details on write/read pipelines, database transactions, and failover scenarios.
+* [DESIGN_DECISIONS.md](./DESIGN_DECISIONS.md) - Rationale behind architectural choices (modulo sharding, Snowflake IDs) and the future scaling roadmap.
+* [DEVELOPER_WORKER_GUIDE.md](./DEVELOPER_WORKER_GUIDE.md) - Code patterns, visibility timeout planning, and best practices for writing consumer workers.
+* [OPERATIONAL_PLAYBOOK.md](./OPERATIONAL_PLAYBOOK.md) - Step-by-step guides for database resharding, DLQ operations, and credential rotation.
+* [TROUBLESHOOTING_GUIDE.md](./TROUBLESHOOTING_GUIDE.md) - Diagnostics and fixes for lag, breaker trips, and WAL bloat.
